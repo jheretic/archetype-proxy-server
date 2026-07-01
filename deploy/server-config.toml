@@ -1,0 +1,31 @@
+# Smoke-harness server config for ONE replica (mounted read-only into each
+# replica container; all replicas share this identical config). The LB makes
+# them distinct by pinning sessions per-replica via a cookie, NOT by config.
+#
+# MOCK posture: this is for the multi-replica stickiness SMOKE TEST only, never
+# production. allow_mock=true + ARCHETYPE_PROXY_INSECURE_DEV=1 (set in compose)
+# let a build start with mock attestation.
+#
+# `listen` is overridden to 0.0.0.0:8443 via ARCHETYPE_PROXY_LISTEN in compose
+# (a container must bind all interfaces; the default 127.0.0.1 is loopback-only).
+
+[attestation]
+tee_provider = "mock"
+verifier = "mock"
+allow_mock = true
+atb_ttl_secs = 300
+atb_eviction_interval_secs = 60
+atb_max_sessions = 10000
+
+# Per-replica rate limit (per-IP sliding window). DISABLED in the smoke harness
+# so the request batch is never throttled. In production this is a PER-REPLICA
+# limit: effective cluster cap = max_requests x N replicas (see README caveats).
+[rate_limit]
+max_requests = 0
+window_secs = 60
+
+# Single catch-all route to the shared dummy upstream (the compose `upstream`
+# service). Every replica forwards decrypted requests here.
+[[route]]
+name = "default"
+upstream = "http://upstream:8080"

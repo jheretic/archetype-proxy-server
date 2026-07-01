@@ -1,0 +1,177 @@
+# Maintainer: archetype-proxy maintainers <ops@example.com>
+#
+# ============================================================================
+#  archetype-proxy-server -- Arch Linux PKGBUILD (-git / VCS package)
+# ============================================================================
+#
+#  This is a `-git` style PKGBUILD: it builds the repo HEAD of
+#  github.com/jheretic/archetype-proxy-server. There is no upstream release
+#  tag yet, so a VCS package is the most useful form (pkgver() derives the
+#  version from the latest tag/commit count). To pin a specific commit,
+#  change `source` to `...#commit=<sha>` and drop the pkgver() function.
+#
+#  ----------------------------------------------------------------------------
+#  !!! CRITICAL BUILD CONSTRAINTS -- read before packaging !!!
+#  ----------------------------------------------------------------------------
+#  This crate transitively builds two C/FIPS dependencies whose build is very
+#  sensitive to the host toolchain. A naive `cargo build` on a stock Arch box
+#  WILL FAIL. The build() function below sets up the required environment; the
+#  reasons are documented here so future maintainers do not "fix" it back to
+#  broken:
+#
+#  1. oqs-sys 0.11 + libclang >= 19 = COMPILE FAILURE.
+#     oqs-sys runs bindgen at build time. With libclang >= 19 (which Arch's
+#     stock `clang` package is -- currently 19/20+), bindgen emits a
+#     self-contradictory OQS_SIG layout assertion and the crate fails with:
+#         error[E0080]: attempt to compute `1_usize - 88_usize`
+#     FIX: bindgen must use a libclang <= 18. We makedepend on `llvm18`
+#     (provides /usr/lib/llvm18/lib/libclang.so) and export LIBCLANG_PATH to
+#     it. `llvm18`/`clang18` are NOT in the official repos at time of writing;
+#     install them from the AUR (e.g. `llvm18`, `clang18`) OR adjust
+#     _LIBCLANG18_DIR below to wherever your libclang-18 lives. The clang
+#     BINARY version is irrelevant to bindgen -- only LIBCLANG_PATH matters.
+#
+#  2. aws-lc-fips-sys (pulled by the `fips` feature pinned at the OpenHTTPA
+#     workspace root) builds the FIPS module via Go + cmake + a C compiler.
+#     Its FIPS "delocate" step parses compiler-emitted assembly. With a
+#     bleeding-edge GCC + binutils (verified failing on gcc 16 / binutils
+#     2.46) the delocator aborts with:
+#         error while processing "...": ".data section found in module"
+#     FIX: build the C side with CLANG, which emits assembly the delocator
+#     accepts. We export CC=clang / CXX=clang++. (Verified: the build that
+#     fails under gcc succeeds verbatim once CC=clang is set.) This is why
+#     `clang` is a makedepend in ADDITION to `llvm18` -- the stock clang is
+#     the C COMPILER for aws-lc-fips, while llvm18 supplies libclang for
+#     bindgen. They are independent.
+#
+#  3. NETWORK IS REQUIRED AT BUILD TIME. The crate's dependencies are pinned
+#     to an OpenHTTPA git rev (not crates.io), so prepare()/build() must fetch
+#     that git dependency and the cargo registry. This deviates from the ideal
+#     "all sources declared up front" PKGBUILD rule; it is unavoidable given
+#     the git dependency. The build is therefore NOT done with --frozen (the
+#     git dep must be resolved); we do use --release.
+#
+#  Makedepends summary: rust>=1.88, cargo, go, cmake, clang (C compiler for
+#  aws-lc-fips), llvm18 (libclang<=18 for oqs-sys bindgen), git.
+# ============================================================================
+
+pkgname=archetype-proxy-server-git
+_pkgname=archetype-proxy-server
+pkgver=0.1.0.r0.g36116f3
+pkgrel=1
+pkgdesc="Attested reverse proxy (OpenHTTPA): per-request TEE attestation, sticky multi-replica sessions, mock-by-default with feature-gated real TEE backends"
+arch=('x86_64')  # aarch64 also builds but x86_64 is the tested target
+url="https://github.com/jheretic/archetype-proxy-server"
+license=('Apache-2.0')
+depends=('glibc' 'gcc-libs')
+makedepends=('rust' 'cargo' 'go' 'cmake' 'clang' 'llvm18' 'git')
+provides=("${_pkgname}=${pkgver}")
+conflicts=("${_pkgname}")
+options=('!lto')  # let aws-lc-fips/oqs manage their own codegen; avoid makepkg LTO surprises
+source=("${_pkgname}::git+https://github.com/jheretic/archetype-proxy-server.git"
+        "${_pkgname}.service")
+sha256sums=('SKIP'
+            'SKIP')
+
+# Directory containing libclang.so for LLVM/clang 18. Override here if your
+# llvm18 package installs it elsewhere (e.g. /usr/lib/llvm-18/lib).
+_LIBCLANG18_DIR="/usr/lib/llvm18/lib"
+
+# OPTIONAL real-TEE cargo features. The default (empty) build is MOCK-ONLY and
+# will REFUSE to start in release mode (see no-mock guard note in package()).
+# Build a real, deployable binary by setting the features for your platform,
+# e.g.:
+#     _FEATURES="tdx,maa"   makepkg -f
+# Valid features: tdx sev_snp sgx trustzone aws_nitro (TEE providers);
+#                 maa ita amd_snp (quote verifiers); kubernetes (k8s discovery).
+# Each real-TEE feature requires the matching hardware SDK / system library at
+# build AND run time.
+: "${_FEATURES:=}"
+
+pkgver() {
+  cd "${srcdir}/${_pkgname}"
+  # 0.1.0.r<commits>.g<shorthash>; falls back gracefully if no tags exist.
+  ( git describe --long --tags 2>/dev/null \
+      | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g' ) \
+    || printf "0.1.0.r%s.g%s" \
+         "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "${srcdir}/${_pkgname}"
+  # Fetch crates + the pinned OpenHTTPA git dependency now (build() also needs
+  # network, but doing it here surfaces fetch failures early).
+  export CARGO_HOME="${srcdir}/cargo-home"
+  cargo fetch --locked || cargo fetch
+}
+
+build() {
+  cd "${srcdir}/${_pkgname}"
+
+  # --- Required toolchain environment (see CRITICAL BUILD CONSTRAINTS) ---
+  # (1) libclang <= 18 for oqs-sys bindgen:
+  if [[ ! -e "${_LIBCLANG18_DIR}/libclang.so" ]]; then
+    error "libclang.so not found in ${_LIBCLANG18_DIR}."
+    error "Install llvm18/clang18 (AUR) or set _LIBCLANG18_DIR to its location."
+    return 1
+  fi
+  export LIBCLANG_PATH="${_LIBCLANG18_DIR}"
+  # (2) clang as the C/C++ compiler for the aws-lc-fips FIPS delocate step:
+  export CC=clang
+  export CXX=clang++
+  # (3) Go toolchain for aws-lc-fips (provided by the `go` makedepend; on PATH).
+
+  export CARGO_HOME="${srcdir}/cargo-home"
+  export CARGO_TARGET_DIR="${srcdir}/target"
+  export RUSTUP_TOOLCHAIN=stable  # honored if rustup-managed; harmless otherwise
+
+  local feat_args=()
+  if [[ -n "${_FEATURES}" ]]; then
+    msg2 "Building with TEE/optional features: ${_FEATURES}"
+    feat_args=(--features "${_FEATURES}")
+  else
+    msg2 "Building MOCK-ONLY (no TEE features). The release binary will refuse"
+    msg2 "to start unless built with a real TEE feature or run with"
+    msg2 "ARCHETYPE_PROXY_INSECURE_DEV=1 (insecure). See package() note."
+  fi
+
+  # NOT --frozen: the OpenHTTPA git dependency must be resolved over the network.
+  cargo build --release --bin "${_pkgname}" "${feat_args[@]}"
+}
+
+package() {
+  cd "${srcdir}/${_pkgname}"
+
+  # Binary.
+  install -Dm755 "${srcdir}/target/release/${_pkgname}" \
+    "${pkgdir}/usr/bin/${_pkgname}"
+
+  # License.
+  install -Dm644 LICENSE \
+    "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+
+  # Example config -> /etc (operator copies to archetype-proxy.toml and edits).
+  install -Dm644 archetype-proxy.toml \
+    "${pkgdir}/etc/archetype-proxy/archetype-proxy.toml.example"
+  # Also drop it under /usr/share/doc for reference.
+  install -Dm644 archetype-proxy.toml \
+    "${pkgdir}/usr/share/doc/${pkgname}/archetype-proxy.toml.example"
+  install -Dm644 README.md \
+    "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+
+  # systemd unit.
+  install -Dm644 "${srcdir}/${_pkgname}.service" \
+    "${pkgdir}/usr/lib/systemd/system/${_pkgname}.service"
+
+  # ------------------------------------------------------------------------
+  # NO-MOCK-IN-RELEASE GUARD (intended behavior, not a bug):
+  # A stock package built with NO TEE features is mock-only. The release
+  # binary's startup guard will REFUSE to boot because mock attestation
+  # provides zero security. To run it you must either:
+  #   * rebuild with a real TEE feature (_FEATURES="tdx,maa" makepkg) and set
+  #     a real tee_provider+verifier with allow_mock=false in the config, OR
+  #   * explicitly opt into an INSECURE dev server by setting
+  #     ARCHETYPE_PROXY_INSECURE_DEV=1 (never in production).
+  # The installed systemd unit deliberately does NOT set that escape hatch.
+  # ------------------------------------------------------------------------
+}

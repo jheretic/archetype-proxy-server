@@ -1,0 +1,125 @@
+# archetype-proxy-server configuration (layered, Traefik-style).
+#
+# Copy to ./archetype-proxy.toml or point ARCHETYPE_PROXY_CONFIG / argv[1] at it.
+#
+# Precedence (highest wins): CLI flag > env (ARCHETYPE_PROXY_*) > discovered
+# labels/annotations > this file > built-in defaults.
+#
+# STATIC config ([server], [attestation], [discovery]) is read ONCE at boot.
+# DYNAMIC config (the [[route]] table) is also fed by discovery and hot-reloads.
+
+# --- STATIC ---------------------------------------------------------------
+
+[server]
+listen = "127.0.0.1:8443"
+max_body_bytes = 4194304          # 4 MiB; enforced on decrypted request + upstream response
+# Public-TLS termination (optional). If set, BOTH cert_path and key_path are
+# required (PEM). The server terminates public TLS in-process via axum-server +
+# rustls (aws-lc-rs backend); all routes (/healthz, /readyz, /metrics, attested)
+# serve over the TLS listener. FAIL-FAST: a missing/unreadable/invalid cert or
+# key aborts startup — it never falls back to plaintext on a TLS-labelled port.
+# Omit this block to serve plaintext behind a TLS-terminating ingress/LB.
+# A [server.tls] block must configure EXACTLY ONE cert source: static PEM files
+# OR ACME (mutually exclusive; validated at startup).
+#
+# --- Static PEM files ---
+# [server.tls]
+# cert_path = "/etc/archetype/tls/fullchain.pem"
+# key_path  = "/etc/archetype/tls/privkey.pem"
+#
+# --- ACME automatic provisioning (auto-renewing; see README "TLS posture") ---
+# [server.tls.acme]
+# enabled   = true
+# domains   = ["proxy.example.com"]   # SANs on the issued cert; >=1 required
+# contact   = "ops@example.com"        # stored as mailto: on the ACME account
+# challenge = "tls-alpn-01"            # tls-alpn-01 (default) | http-01 | dns-01
+# staging   = true                     # use LE STAGING while testing (rate limits!)
+# cache_dir = "/var/lib/archetype/acme" # persists account key + issued cert
+# # directory_url = "https://acme.example/dir"  # explicit CA; overrides `staging`
+# #
+# # Challenge prerequisites:
+# #   tls-alpn-01: CA must reach inbound :443 (validation cert served via the
+# #                `acme-tls/1` ALPN on the existing listener; no extra port).
+# #   http-01:     CA must reach inbound :80 (or http01_listen); a plaintext
+# #                responder serves GET /.well-known/acme-challenge/{token}.
+# #   dns-01:      a _acme-challenge TXT record must be published; the ONLY
+# #                challenge that can issue WILDCARD certs.
+# # http01_listen = "0.0.0.0:80"        # only for challenge="http-01"
+# #
+# # Wildcard certs require challenge="dns-01":
+# # [server.tls.acme]
+# # enabled   = true
+# # domains   = ["*.example.com", "example.com"]
+# # challenge = "dns-01"
+# # [server.tls.acme.dns]
+# # provider         = "manual"        # only `manual` is implemented
+# # hook_command     = "/usr/local/bin/publish-txt.sh"  # gets ACME_DNS_{DOMAIN,NAME,VALUE}
+# # cleanup_command  = "/usr/local/bin/cleanup-txt.sh"  # optional best-effort
+# # propagation_secs = 60              # wait before asking the CA to validate
+
+[attestation]
+# --- Provider / verifier selection (task #7) -----------------------------
+# tee_provider: mock | tdx | sev_snp | sgx | trustzone | aws_nitro
+# verifier:     mock | maa | ita | amd_snp
+# Real (non-mock) variants ONLY exist when this crate is BUILT with the
+# matching cargo feature (the default build is mock-only and needs no TEE
+# hardware). Selecting e.g. tee_provider="tdx" without `--features tdx` is a
+# fatal startup error. See README "Real TEE providers".
+tee_provider = "mock"
+verifier = "mock"
+# verifier_endpoint = "https://sharedeus2.eus2.attest.azure.net"  # MAA / ITA REST endpoint
+# verifier_api_key  = "..."                                        # ITA only
+
+# allow_mock: allow the Mock TEE fallback. MUST be false in production.
+# NO-MOCK-IN-RELEASE GUARD: a RELEASE build refuses to start if mock
+# attestation is in effect (allow_mock=true OR tee_provider="mock" OR
+# verifier="mock") unless ARCHETYPE_PROXY_INSECURE_DEV=1 is set (which logs a
+# LOUD warning). Debug builds allow mock (still warn). See README.
+allow_mock = true
+strict_attestation = false        # global default for per-route strict mode (enforcement: task #7)
+atb_ttl_secs = 300                # attestation-token-binding (session) TTL
+atb_eviction_interval_secs = 60   # background reap cadence for expired AtB sessions.
+                                  # Single-use sessions (one handshake per bridged
+                                  # request) are actively evicted so a long-running
+                                  # bridge can never exhaust the registry.
+atb_max_sessions = 10000          # registry capacity (max concurrent live sessions)
+
+[rate_limit]                      # optional per-IP sliding-window rate limit on all routes
+max_requests = 0                  # 0 = DISABLED (default). e.g. 200 = 200 req/window/IP
+window_secs = 60
+
+[discovery]
+docker = false                    # OFF by default. Requires Docker socket access — see README RISK.
+docker_socket = "unix:///var/run/docker.sock"
+docker_poll_secs = 10
+kubernetes = false                # annotation-based watcher over Services/Ingresses.
+                                  # Requires a binary built with `--features kubernetes`
+                                  # (the watcher + kube/k8s-openapi are gated behind that
+                                  # cargo feature so the default build stays lean). Without
+                                  # the feature, enabling this just logs a warning. Needs RBAC
+                                  # get/list/watch on services + ingresses — see README.
+# kubernetes_namespace = "prod"   # optional namespace filter (default: all).
+                                  # A higher-precedence layer can CLEAR this:
+                                  # set ARCHETYPE_PROXY_KUBERNETES_NAMESPACE=""
+                                  # (empty) to force all-namespaces.
+
+# --- DYNAMIC --------------------------------------------------------------
+# Zero or more routes. A request is matched to the most-specific route by host
+# (exact, case-insensitive) and path_prefix; longest prefix and host-match win.
+# Routes can also be supplied by discovery (Docker labels / K8s annotations).
+
+[[route]]
+name = "api"
+host = "api.internal"             # optional; empty = match any host
+path_prefix = "/v1"               # optional; empty = match any path
+upstream = "http://127.0.0.1:8080"
+# strict_attestation = true       # optional per-route override (enforcement: task #7)
+
+[[route]]
+name = "default"
+upstream = "http://127.0.0.1:8000"  # catch-all fallback (no host/prefix)
+
+# Backwards-compat: a legacy single upstream is still accepted and becomes a
+# catch-all route:
+# [upstream]
+# target = "http://127.0.0.1:8080"

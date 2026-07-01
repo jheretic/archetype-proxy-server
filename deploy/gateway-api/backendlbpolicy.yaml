@@ -1,0 +1,34 @@
+# archetype-proxy-server: COOKIE session persistence via BackendLBPolicy
+# (GEP-1619, Direct Policy Attachment form).
+#
+# Use THIS form (instead of the inline HTTPRoute.rules[].sessionPersistence in
+# httproute.yaml) when your controller implements session persistence as a
+# BackendLBPolicy attached to the backend Service rather than as an inline
+# HTTPRoute field. Controllers vary in which form they support — check your
+# controller's Gateway API conformance (see README.md). Apply only ONE form.
+#
+# This file carries ONLY the policy. Reuse the Deployment / Service / ConfigMap
+# / Gateway / HTTPRoute from httproute.yaml (drop the inline sessionPersistence
+# block from the HTTPRoute rule when using BackendLBPolicy to avoid two
+# competing persistence configs).
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: BackendLBPolicy
+metadata:
+  name: archetype-proxy-server-affinity
+spec:
+  # Direct Policy Attachment: target the backend Service the HTTPRoute routes
+  # to. The policy applies cookie affinity to traffic destined for that Service.
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: archetype-proxy-server
+  # Equivalent to the inline HTTPRoute form: a backend-pinning cookie named
+  # APROXYID set on the POST /attest handshake response and routed by it
+  # thereafter. SAME mechanism, SAME cookie, NO client change. See README.md.
+  sessionPersistence:
+    sessionName: APROXYID
+    type: Cookie               # Core support. type: Header is Extended support.
+    # cookieConfig:
+    #   lifetimeType: Session   # default; no Expires/Max-Age -> per-process pin
+    # absoluteTimeout: 1h       # EXTENDED; only with lifetimeType: Permanent

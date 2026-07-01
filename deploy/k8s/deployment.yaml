@@ -1,0 +1,112 @@
+# archetype-proxy-server: N>1 replica Deployment + Service + nginx-ingress
+# Ingress with COOKIE affinity. Apply after building/pushing the image
+# (deploy/Dockerfile) to a registry your cluster can pull.
+#
+# MOCK posture (ARCHETYPE_PROXY_INSECURE_DEV=1, allow_mock) is for a smoke
+# cluster only. For production: drop INSECURE_DEV, set a real tee_provider /
+# verifier, and terminate TLS (here or at the ingress).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: archetype-proxy-config
+data:
+  archetype-proxy.toml: |
+    [attestation]
+    tee_provider = "mock"
+    verifier = "mock"
+    allow_mock = true
+    atb_ttl_secs = 300
+    atb_max_sessions = 10000
+    [rate_limit]
+    max_requests = 0          # per-replica; cluster cap = max_requests x replicas
+    window_secs = 60
+    [[route]]
+    name = "default"
+    upstream = "http://upstream:8080"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: archetype-proxy-server
+spec:
+  replicas: 3                 # N>1; each has its OWN in-memory AtbRegistry
+  selector:
+    matchLabels: { app: archetype-proxy-server }
+  template:
+    metadata:
+      labels: { app: archetype-proxy-server }
+    spec:
+      containers:
+        - name: server
+          image: archetype-proxy-server:smoke   # replace with your registry ref
+          args: ["/etc/archetype/archetype-proxy.toml"]
+          env:
+            - name: ARCHETYPE_PROXY_LISTEN
+              value: "0.0.0.0:8443"             # bind all ifaces (default loopback)
+            - name: ARCHETYPE_PROXY_INSECURE_DEV
+              value: "1"                          # smoke only; remove in prod
+          ports:
+            - containerPort: 8443
+          volumeMounts:
+            - name: config
+              mountPath: /etc/archetype
+              readOnly: true
+          # Health-check routing: K8s only sends traffic to replicas whose
+          # readiness probe passes, and restarts ones failing liveness. Both
+          # endpoints are UNAUTHENTICATED.
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8443 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8443 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap: { name: archetype-proxy-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: archetype-proxy-server
+spec:
+  selector: { app: archetype-proxy-server }
+  ports:
+    - name: http
+      port: 8443
+      targetPort: 8443
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: archetype-proxy-server
+  annotations:
+    # COOKIE AFFINITY (ingress-nginx). The ingress sets a backend-pinning cookie
+    # on the first response (the POST /attest handshake) and routes by it; the
+    # client's cookie-store transport (task #20) echoes it -> handshake + its
+    # trusted request hit the SAME replica. `affinity-mode: persistent` keeps a
+    # session pinned even when the replica set changes (no rehash churn).
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/affinity-mode: "persistent"
+    nginx.ingress.kubernetes.io/session-cookie-name: "APROXYID"
+    nginx.ingress.kubernetes.io/session-cookie-path: "/"
+    nginx.ingress.kubernetes.io/session-cookie-samesite: "Lax"
+    # WebSocket: the SAME cookie pins the attested WS GET upgrade; once upgraded
+    # the socket rides one TCP connection ingress-nginx never rebalances. Long
+    # proxy timeouts so an idle attested WS is not dropped mid-conversation.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: archetype-proxy-server
+                port:
+                  number: 8443

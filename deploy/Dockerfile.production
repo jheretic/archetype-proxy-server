@@ -1,0 +1,92 @@
+# =============================================================================
+#  PRODUCTION Dockerfile for archetype-proxy-server.
+#
+#  Build context MUST be the archetype-proxy-server repo root:
+#    docker build -f deploy/Dockerfile.production \
+#      --build-arg FEATURES=tdx,maa \
+#      -t archetype-proxy-server:prod .
+#
+#  HOW THIS DIFFERS FROM deploy/Dockerfile (the smoke image):
+#    * deploy/Dockerfile is MOCK-only and is meant to be run with
+#      ARCHETYPE_PROXY_INSECURE_DEV=1 (set in docker-compose) so the no-mock
+#      release guard does not refuse to boot. It is for multi-replica
+#      stickiness SMOKE TESTS, never production.
+#    * THIS image does NOT set ARCHETYPE_PROXY_INSECURE_DEV. A stock build with
+#      no TEE feature is mock-only and will therefore CORRECTLY REFUSE to start
+#      in release mode -- the right production safety default. To get a
+#      deployable image you MUST build with a real TEE feature, e.g.
+#        --build-arg FEATURES=tdx,maa
+#      and run with a real tee_provider+verifier and allow_mock=false.
+#    * The builder installs the toolchain aws-lc-fips + oqs-sys need (go, cmake,
+#      clang/libclang) and pins CC=clang -- see notes below.
+#
+#  WHY THE SMOKE Dockerfile can get away with a bare `cargo build`:
+#    On Debian bookworm the default clang/libclang is v14 (<= 18), so the
+#    oqs-sys >= 19 bindgen bug never triggers -- unlike bleeding-edge Arch.
+#    (Verified by inspection of bookworm package versions, not by building the
+#    smoke image here.) The aws-lc-fips Go/cmake requirement still applies; if
+#    the smoke image builds without installing them, its base layer must supply
+#    them. This production image installs go + cmake EXPLICITLY so the build is
+#    self-contained and does not depend on undocumented base-image contents.
+# =============================================================================
+
+FROM rust:1.95-bookworm AS builder
+WORKDIR /src
+
+# Toolchain for the C/FIPS dependencies:
+#   * cmake + golang + clang : aws-lc-fips-sys builds the FIPS module via
+#     Go + cmake + a C compiler.
+#   * libclang-dev           : oqs-sys runs bindgen, which needs libclang.
+#     Bookworm's libclang is v14 (<= 18), so the oqs-sys + new-libclang bug
+#     does NOT apply here (it bites bleeding-edge distros like Arch).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        cmake golang clang libclang-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build the C side with clang. aws-lc-fips's FIPS "delocate" step parses
+# compiler-emitted assembly and aborts (".data section found in module") under
+# some bleeding-edge GCC/binutils combinations; clang emits assembly it
+# accepts. (Verified on the host build: gcc fails, CC=clang succeeds.)
+ENV CC=clang CXX=clang++
+
+# Optional real-TEE cargo features. EMPTY default => MOCK-only build that will
+# refuse to start in release (no-mock guard) -- intended. For a deployable
+# image pass e.g. --build-arg FEATURES=tdx,maa
+#   providers: tdx sev_snp sgx trustzone aws_nitro
+#   verifiers: maa ita amd_snp        (also: kubernetes for k8s discovery)
+ARG FEATURES=""
+
+# Cache deps: copy manifests first. (Cargo.lock pins the full graph.)
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY src ./src
+COPY tests ./tests
+
+# NOT --frozen: the pinned OpenHTTPA git dependency must be resolved over the
+# network at build time.
+RUN cargo build --release --bin archetype-proxy-server \
+      ${FEATURES:+--features "$FEATURES"}
+
+# -----------------------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /src/target/release/archetype-proxy-server \
+     /usr/local/bin/archetype-proxy-server
+
+# Non-root runtime user.
+RUN useradd --system --no-create-home --uid 10001 archetype
+USER 10001:10001
+
+# Default listen is 127.0.0.1:8443 (loopback). In a container you MUST bind all
+# interfaces so a load balancer / ingress can reach it. Override at run time:
+#   docker run -e ARCHETYPE_PROXY_LISTEN=0.0.0.0:8443 ...
+EXPOSE 8443
+
+# NOTE: ARCHETYPE_PROXY_INSECURE_DEV is intentionally NOT set. A stock
+# (no-feature) image is mock-only and will refuse to start in release mode.
+# Build with --build-arg FEATURES=<real-tee> and configure a real
+# provider+verifier (allow_mock=false) for production.
+ENTRYPOINT ["/usr/local/bin/archetype-proxy-server"]

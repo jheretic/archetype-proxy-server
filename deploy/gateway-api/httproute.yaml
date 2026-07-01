@@ -1,0 +1,142 @@
+# archetype-proxy-server: Kubernetes Gateway API deployment with COOKIE-based
+# session persistence (GEP-1619), INLINE HTTPRoute form.
+#
+# This is the Gateway API equivalent of deploy/k8s/deployment.yaml's
+# ingress-nginx `affinity: cookie`. SAME mechanism, SAME cookie, NO client
+# change: the LB sets a backend-pinning cookie on the POST /attest handshake
+# response and routes by it; the client's cookie-store transport echoes it so
+# the handshake + its trusted request (and the WS GET upgrade) land on the SAME
+# replica. See deploy/gateway-api/README.md for the EXPERIMENTAL/controller
+# caveats you MUST read before relying on this.
+#
+# Deployment / Service / ConfigMap mirror deploy/k8s/deployment.yaml
+# (3 replicas, each with its OWN in-memory AtbRegistry -> replica-local
+# sessions -> stickiness required).
+#
+# MOCK posture (ARCHETYPE_PROXY_INSECURE_DEV=1, allow_mock) is for a smoke
+# cluster only. For production: drop INSECURE_DEV, set a real tee_provider /
+# verifier, and terminate TLS (here or at the Gateway).
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: archetype-proxy-config
+  labels:
+    archetype.li/component: server
+data:
+  archetype-proxy.toml: |
+    [attestation]
+    tee_provider = "mock"
+    verifier = "mock"
+    allow_mock = true
+    atb_ttl_secs = 300
+    atb_max_sessions = 10000
+    [rate_limit]
+    max_requests = 0          # per-replica; cluster cap = max_requests x replicas
+    window_secs = 60
+    [[route]]
+    name = "default"
+    upstream = "http://upstream:8080"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: archetype-proxy-server
+spec:
+  replicas: 3                 # N>1; each has its OWN in-memory AtbRegistry
+  selector:
+    matchLabels: { app: archetype-proxy-server }
+  template:
+    metadata:
+      labels: { app: archetype-proxy-server }
+    spec:
+      containers:
+        - name: server
+          image: archetype-proxy-server:smoke   # replace with your registry ref
+          args: ["/etc/archetype/archetype-proxy.toml"]
+          env:
+            - name: ARCHETYPE_PROXY_LISTEN
+              value: "0.0.0.0:8443"             # bind all ifaces (default loopback)
+            - name: ARCHETYPE_PROXY_INSECURE_DEV
+              value: "1"                          # smoke only; remove in prod
+          ports:
+            - containerPort: 8443
+          volumeMounts:
+            - name: config
+              mountPath: /etc/archetype
+              readOnly: true
+          # Health-check routing is a Service/controller concern in Gateway API
+          # (there is no Gateway-level health field). K8s only sends traffic to
+          # replicas whose readiness probe passes, and restarts ones failing
+          # liveness. Both endpoints are UNAUTHENTICATED.
+          readinessProbe:
+            httpGet: { path: /readyz, port: 8443 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8443 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: config
+          configMap: { name: archetype-proxy-config }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: archetype-proxy-server
+spec:
+  selector: { app: archetype-proxy-server }
+  ports:
+    - name: http
+      port: 8443
+      targetPort: 8443
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: archetype-proxy-gateway
+spec:
+  # Replace with the GatewayClass your controller installs (e.g. istio,
+  # cilium, envoy-gateway). The controller MUST implement GEP-1619
+  # (HTTPRouteSessionPersistence) for the sessionPersistence field below to
+  # take effect — see README.md.
+  gatewayClassName: REPLACE-WITH-YOUR-GATEWAYCLASS
+  listeners:
+    - name: http
+      protocol: HTTP
+      port: 8443
+      allowedRoutes:
+        namespaces: { from: Same }
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: archetype-proxy-server
+spec:
+  parentRefs:
+    - name: archetype-proxy-gateway
+  rules:
+    - backendRefs:
+        - name: archetype-proxy-server
+          port: 8443
+      # COOKIE session persistence (GEP-1619, inline form). The Gateway sets a
+      # backend-pinning cookie named APROXYID on the first response (the POST
+      # /attest handshake) and routes by it thereafter; the client's
+      # cookie-store transport echoes it -> handshake + its trusted request hit
+      # the SAME replica. For WebSockets the same cookie pins the GET upgrade;
+      # once upgraded the socket rides one TCP connection the Gateway never
+      # rebalances, so all frames stay on that replica for the socket lifetime.
+      sessionPersistence:
+        sessionName: APROXYID
+        type: Cookie            # Core support. type: Header is Extended support.
+        # cookieConfig.lifetimeType defaults to Session (no Expires/Max-Age set
+        # on the cookie -> dropped when the client process exits). This matches
+        # the per-process session model. Uncomment to be explicit:
+        # cookieConfig:
+        #   lifetimeType: Session
+        # absoluteTimeout is EXTENDED support (Duration). Only meaningful with
+        # lifetimeType: Permanent; do NOT combine with Session lifetime. Caps
+        # how long a pin survives before the client must re-handshake (task #19
+        # auto-recovers a residual miss, so this is a tuning knob, not a hazard):
+        # absoluteTimeout: 1h

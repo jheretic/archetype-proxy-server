@@ -1,0 +1,70 @@
+# Multi-replica stickiness SMOKE HARNESS.
+#
+#   N=2 archetype-proxy-server replicas (NO shared registry) behind a HAProxy
+#   cookie-affinity LB, all forwarding to one shared dummy upstream.
+#
+# Run from the REPO ROOT (so build context `.` and `./deploy/...` volume paths
+# resolve correctly):
+#   docker compose --project-directory . -f deploy/docker-compose.yml up --build
+#   (then drive traffic at http://localhost:8080 — see deploy/smoke-test.sh)
+# deploy/smoke-test.sh does this for you.
+#
+# The replicas are byte-identical (same image + mounted config); the LB makes
+# them distinct by pinning each session to the replica that served its
+# handshake via the SRVID cookie. A request that lands on the wrong replica is
+# rejected with a bare 401 (the stickiness miss the client recovers from), so a
+# WORKING harness shows ZERO such misses under cookie affinity.
+#
+# MOCK posture: ARCHETYPE_PROXY_INSECURE_DEV=1 lets the release binary boot with
+# mock attestation. NEVER use this compose file as a production template.
+
+services:
+  upstream:
+    # Shared dummy upstream: echoes request metadata as JSON on every path.
+    image: mendhak/http-https-echo:31
+    environment:
+      HTTP_PORT: "8080"
+    expose:
+      - "8080"
+
+  replica1:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+    image: archetype-proxy-server:smoke
+    command: ["/etc/archetype/archetype-proxy.toml"]
+    environment:
+      ARCHETYPE_PROXY_LISTEN: "0.0.0.0:8443"   # bind all ifaces (default is loopback)
+      ARCHETYPE_PROXY_INSECURE_DEV: "1"          # allow mock posture on a release build
+      RUST_LOG: "archetype_proxy_server=info"
+    volumes:
+      - ./deploy/server-config.toml:/etc/archetype/archetype-proxy.toml:ro
+    expose:
+      - "8443"
+    depends_on:
+      - upstream
+
+  replica2:
+    image: archetype-proxy-server:smoke      # reuse replica1's built image
+    command: ["/etc/archetype/archetype-proxy.toml"]
+    environment:
+      ARCHETYPE_PROXY_LISTEN: "0.0.0.0:8443"
+      ARCHETYPE_PROXY_INSECURE_DEV: "1"
+      RUST_LOG: "archetype_proxy_server=info"
+    volumes:
+      - ./deploy/server-config.toml:/etc/archetype/archetype-proxy.toml:ro
+    expose:
+      - "8443"
+    depends_on:
+      - upstream
+      - replica1   # ensure the image is built once by replica1
+
+  lb:
+    image: haproxy:2.9
+    ports:
+      - "8080:8080"     # the single front address the client/bridge targets
+    volumes:
+      - ./deploy/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - replica1
+      - replica2
