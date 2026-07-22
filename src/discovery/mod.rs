@@ -1,6 +1,6 @@
-// Discovery: providers yield dynamic Routes that are hot-merged into the live
-// route table. Static config (server/attestation/which providers are enabled)
-// is resolved once at boot and never reloads here.
+// Discovery: providers yield dynamic Routes that are merged into the live
+// route table at runtime. Static config (server/attestation/which providers
+// are enabled) is resolved once at boot and not reloaded here.
 
 pub mod docker;
 pub mod k8s;
@@ -28,7 +28,7 @@ pub trait DiscoveryProvider: Send + Sync {
     fn name(&self) -> &'static str;
 
     /// Run until the channel closes or the provider gives up. Implementations
-    /// MUST NOT panic on transient backend errors — log and keep the proxy
+    /// must not panic on transient backend errors: log them and keep the proxy
     /// serving file/env routes.
     async fn run(self: Box<Self>, tx: mpsc::Sender<ProviderUpdate>);
 }

@@ -1,7 +1,7 @@
-//! Lightweight, dependency-free process metrics exposed in Prometheus text
-//! format at `/metrics` (task #7). Hand-rolled atomics keep the dependency
-//! surface minimal (no `metrics`/`metrics-exporter-prometheus`); the counters
-//! are incremented at the proxy hot-path edges WITHOUT touching the crypto.
+//! Process metrics exposed in Prometheus text format at `/metrics`. Uses
+//! plain atomics rather than the `metrics`/`metrics-exporter-prometheus`
+//! crates to keep the dependency surface small; the counters are incremented
+//! at the proxy hot-path edges.
 //!
 //! Exposed series:
 //!   * `archetype_proxy_handshakes_total`        (counter)
@@ -15,8 +15,8 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Upstream-latency histogram bucket upper bounds (seconds). Matches the common
-/// Prometheus default-ish ladder; the implicit `+Inf` bucket is added on render.
+/// Upstream-latency histogram bucket upper bounds (seconds). The implicit
+/// `+Inf` bucket is added on render.
 const LATENCY_BUCKETS_SECS: &[f64] = &[
     0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
 ];

@@ -1,7 +1,7 @@
 //! clap v4 (derive) front-end. Parses argv only; the env/file/discovery
 //! layers and the precedence/merge logic live in `config.rs`. CLI is the
-//! highest-precedence layer, so clap's native non-zero exit on a bad value is
-//! exactly the behaviour we want (no silent fallback).
+//! highest-precedence layer; clap exits non-zero on a bad value rather than
+//! falling back.
 
 use std::net::SocketAddr;
 
@@ -10,7 +10,9 @@ use clap::{Parser, Subcommand};
 use crate::config::PartialStatic;
 
 /// Log verbosity for the tracing `EnvFilter` default directive. `RUST_LOG`,
-/// when set, OVERRIDES this (see `main.rs`).
+/// when set, overrides this (see `main.rs`).
+///
+/// Kept in sync with the client's `LogLevel`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum LogLevel {
@@ -54,7 +56,7 @@ pub struct Args {
     #[arg(long, value_name = "N")]
     pub max_body_bytes: Option<usize>,
 
-    /// Enable Docker label discovery (default off; mirrors --kubernetes).
+    /// Enable Docker label discovery (off by default).
     #[arg(long)]
     pub docker: bool,
 
@@ -67,7 +69,7 @@ pub struct Args {
     pub log_level: Option<LogLevel>,
 
     /// Increase verbosity (-v=debug, -vv/-vvv=trace). `--log-level` wins if
-    /// both are given. `RUST_LOG` overrides either.
+    /// both are given; `RUST_LOG` overrides either.
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     pub verbose: u8,
 
@@ -82,7 +84,7 @@ pub enum Commands {
 }
 
 impl Args {
-    /// `--config` wins over the positional path (matches the legacy parser).
+    /// `--config` wins over the positional path.
     pub fn config_path(&self) -> Option<&str> {
         self.config
             .as_deref()
@@ -106,17 +108,16 @@ impl Args {
         }
     }
 
-    /// Crate-scoped default `EnvFilter` directive, mirroring the legacy
-    /// `archetype_proxy_server=info` fallback in `main.rs` but honoring the
-    /// `--log-level`/`-v` flags. `RUST_LOG` still overrides this.
+    /// Crate-scoped default `EnvFilter` directive (`archetype_proxy_server=<level>`),
+    /// honoring the `--log-level`/`-v` flags. `RUST_LOG` still overrides this.
     pub fn log_directive(&self) -> String {
         format!("archetype_proxy_server={}", self.level().as_str())
     }
 
-    /// Map parsed flags into the existing `PartialStatic` override layer.
-    /// `--docker` / `--kubernetes` are enable-only flags (mirroring each other):
-    /// present => `Some(true)`, absent => `None` (inherit lower config layers).
-    /// To disable discovery enabled by a TOML/env layer, set it false there.
+    /// Map parsed flags into the `PartialStatic` override layer.
+    /// `--docker` / `--kubernetes` are enable-only flags: present => `Some(true)`,
+    /// absent => `None` (inherit lower config layers). To disable discovery
+    /// enabled by a TOML/env layer, set it false there.
     pub fn overrides(&self) -> PartialStatic {
         PartialStatic {
             listen: self.listen,
@@ -175,8 +176,8 @@ mod tests {
 
     #[test]
     fn docker_flag_enable_only() {
-        // Enable-only, mirroring --kubernetes: absent => None (inherit lower
-        // layers), present => Some(true). No --no-docker; disable via TOML/env.
+        // Enable-only: absent => None (inherit lower layers), present =>
+        // Some(true). No --no-docker; disable via TOML/env.
         assert_eq!(parse(&[]).unwrap().overrides().docker_enabled, None);
         assert_eq!(
             parse(&["--docker"]).unwrap().overrides().docker_enabled,
@@ -219,7 +220,7 @@ mod tests {
 
     #[test]
     fn log_level_and_dump_coexist() {
-        // Verbosity flag must not regress the dump subcommand.
+        // Verbosity flag and the dump subcommand can be given together.
         let args = parse(&["-vv", "dump"]).unwrap();
         assert!(args.dump());
         assert_eq!(args.log_directive(), "archetype_proxy_server=trace");

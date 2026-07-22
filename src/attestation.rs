@@ -1,12 +1,12 @@
 //! TEE provider + quote verifier selection from config, and the
-//! no-mock-in-release startup guard (task #7).
+//! no-mock-in-release startup guard.
 //!
 //! # Cargo feature mapping
 //!
 //! Real TEE providers/verifiers in the upstream openhttpa crates are gated
-//! behind cargo features that pull in hardware SDKs / system libraries. We
-//! mirror them as features ON THIS CRATE so the DEFAULT build stays mock-only
-//! and CI-buildable on a box with no TEE hardware:
+//! behind cargo features that pull in hardware SDKs / system libraries. This
+//! crate exposes matching features so the default build stays mock-only and
+//! buildable on a box with no TEE hardware:
 //!
 //! | this crate feature | enables                       | provider / verifier            |
 //! |--------------------|-------------------------------|--------------------------------|
@@ -18,9 +18,10 @@
 //! | `maa`              | `openhttpa-attestation/maa`   | `MaaVerifier`                  |
 //! | `ita`              | `openhttpa-attestation/ita`   | `ItaVerifier`                  |
 //! | `amd_snp`          | `openhttpa-attestation/amd_snp` | `SevSnpVerifier` (full chain)|
+//! | `tpm`              | `openhttpa-attestation/tpm` + `openhttpa-tee/tpm` | `TpmVerifier` + `TpmTeeAdapter` |
 //!
-//! A variant selected at runtime whose feature was NOT compiled in fails fast
-//! with a clear "requires building with --features X" error.
+//! A variant selected at runtime whose feature was not compiled in fails with
+//! a clear "requires building with --features X" error.
 
 use std::sync::Arc;
 
@@ -36,7 +37,7 @@ pub enum AttestationMode {
     /// Real hardware attestation for both provider and verifier.
     Secure,
     /// At least one of provider/verifier/allow_mock is mock. Carries whether
-    /// we are in a release build (so the caller logs the LOUD banner).
+    /// this is a release build so the caller logs the appropriate banner.
     Insecure { release: bool },
 }
 
@@ -46,24 +47,24 @@ pub enum AttestationMode {
 #[error("{0}")]
 pub struct FatalError(pub String);
 
-/// Env var that opts a RELEASE build into running with mock attestation.
+/// Env var that opts a release build into running with mock attestation.
 pub const INSECURE_DEV_ENV: &str = "ARCHETYPE_PROXY_INSECURE_DEV";
 
-/// `true` if the resolved config would use mock attestation in ANY of the
-/// three independent ways it can creep in.
+/// `true` if the resolved config would use mock attestation in any of the
+/// three independent ways it can arise.
 #[must_use]
 pub fn uses_mock(cfg: &AttestationConfig) -> bool {
     cfg.allow_mock || cfg.tee_provider.is_mock() || cfg.verifier.is_mock()
 }
 
-/// PURE, fully unit-testable startup policy. Decides whether the server may
-/// boot given the build profile, the resolved attestation config, and whether
-/// the operator set the insecure-dev escape hatch.
+/// Startup policy: decides whether the server may boot given the build
+/// profile, the resolved attestation config, and whether the operator set the
+/// insecure-dev escape hatch.
 ///
 /// Policy:
 ///   * real provider + real verifier + `allow_mock=false` => `Secure`, boot.
 ///   * mock in effect, debug build                        => `Insecure`, boot (warn).
-///   * mock in effect, release build, escape hatch set    => `Insecure`, boot (LOUD warn).
+///   * mock in effect, release build, escape hatch set    => `Insecure`, boot (warn).
 ///   * mock in effect, release build, no escape hatch     => `Err(FatalError)`.
 ///
 /// # Errors
@@ -78,18 +79,17 @@ pub fn startup_attestation_decision(
         return Ok(AttestationMode::Secure);
     }
     if !is_release {
-        // Dev default: mock allowed, caller still warns.
+        // Debug build: mock allowed, caller still warns.
         return Ok(AttestationMode::Insecure { release: false });
     }
-    // Release build with mock in effect.
     if insecure_dev_env {
         Ok(AttestationMode::Insecure { release: true })
     } else {
         Err(FatalError(format!(
-            "refusing to start: RELEASE build resolved to MOCK attestation \
-             (allow_mock={}, tee_provider={}, verifier={}), which provides ZERO security. \
+            "refusing to start: release build resolved to mock attestation \
+             (allow_mock={}, tee_provider={}, verifier={}), which provides no security. \
              Configure a real hardware tee_provider + verifier (and build with the matching \
-             --features), or set {INSECURE_DEV_ENV}=1 to explicitly run an INSECURE dev server.",
+             --features), or set {INSECURE_DEV_ENV}=1 to explicitly run an insecure dev server.",
             cfg.allow_mock, cfg.tee_provider, cfg.verifier
         )))
     }
@@ -168,6 +168,16 @@ pub fn build_tee_provider(
                 Err(feature_error("tee_provider", "aws_nitro", "aws_nitro"))
             }
         }
+        TeeProviderKind::Tpm => {
+            #[cfg(feature = "tpm")]
+            {
+                Ok(Arc::new(openhttpa_tee::tpm::TpmTeeAdapter))
+            }
+            #[cfg(not(feature = "tpm"))]
+            {
+                Err(feature_error("tee_provider", "tpm", "tpm"))
+            }
+        }
     }
 }
 
@@ -221,8 +231,8 @@ pub fn build_verifier(
         }
         VerifierKind::AmdSnp => {
             // `SevSnpVerifier` is exported on all feature sets, but full VCEK
-            // chain verification only happens under `amd_snp`. Refuse to wire
-            // it without the feature so we never ship a no-op verifier.
+            // chain verification only happens under `amd_snp`. Without the
+            // feature this would be a no-op verifier, so refuse to wire it.
             #[cfg(feature = "amd_snp")]
             {
                 Ok(Arc::new(openhttpa_attestation::SevSnpVerifier::new()))
@@ -232,12 +242,61 @@ pub fn build_verifier(
                 Err(feature_error("verifier", "amd_snp", "amd_snp"))
             }
         }
-        VerifierKind::Tpm | VerifierKind::Nvidia | VerifierKind::Dcap => Err(FatalError(format!(
+        VerifierKind::Tpm => {
+            #[cfg(feature = "tpm")]
+            {
+                build_tpm_verifier(cfg)
+            }
+            #[cfg(not(feature = "tpm"))]
+            {
+                Err(feature_error("verifier", "tpm", "tpm"))
+            }
+        }
+        VerifierKind::Nvidia | VerifierKind::Dcap => Err(FatalError(format!(
             "verifier={} is not supported by archetype-proxy in the pinned openhttpa revision \
-             (no production-ready verifier type is available); choose mock|maa|ita|amd_snp",
+             (no production-ready verifier type is available); choose mock|maa|ita|amd_snp|tpm",
             cfg.verifier
         ))),
     }
+}
+
+/// Build a [`TpmVerifier`] from `[attestation.tpm]`. The reference policy's
+/// `expected_pcrs` must be non-empty (`Config::validate` enforces this at load,
+/// but we re-check here so the fail-closed reason is explicit if this is ever
+/// called without going through `Config::load`).
+#[cfg(feature = "tpm")]
+fn build_tpm_verifier(
+    cfg: &AttestationConfig,
+) -> Result<Arc<dyn QuoteVerifier>, FatalError> {
+    use openhttpa_attestation::tpm_verifier::{TpmReferencePolicy, TpmVerifier};
+    use std::collections::HashMap;
+
+    let tpm = cfg.tpm.as_ref().ok_or_else(|| {
+        FatalError(
+            "verifier=tpm requires an [attestation.tpm] section with expected_pcrs".to_owned(),
+        )
+    })?;
+    if tpm.expected_pcrs.is_empty() {
+        return Err(FatalError(
+            "verifier=tpm requires a non-empty [attestation.tpm].expected_pcrs reference policy"
+                .to_owned(),
+        ));
+    }
+    let expected: HashMap<u32, Vec<u8>> = tpm.expected_pcrs.clone().into_iter().collect();
+    let mut policy = TpmReferencePolicy::from_pcrs(expected);
+    if let Some(ak) = &tpm.pinned_ak_sec1 {
+        policy = policy.with_pinned_ak(ak.clone());
+    }
+    let roots = tpm
+        .trusted_ek_roots_der()
+        .map_err(|e| FatalError(e.to_string()))?;
+    if !roots.is_empty() {
+        policy = policy.with_trusted_ek_roots(roots);
+    }
+    if tpm.allow_unpinned_ak {
+        policy = policy.allow_unpinned_ak(true);
+    }
+    Ok(Arc::new(TpmVerifier::new(policy)))
 }
 
 #[cfg_attr(
@@ -249,7 +308,8 @@ pub fn build_verifier(
         feature = "aws_nitro",
         feature = "maa",
         feature = "ita",
-        feature = "amd_snp"
+        feature = "amd_snp",
+        feature = "tpm"
     ),
     allow(dead_code)
 )]
@@ -276,17 +336,18 @@ mod tests {
             verifier: ver,
             verifier_endpoint: None,
             verifier_api_key: None,
+            tpm: None,
         }
     }
 
-    // ---- the headline guard, all combos ----
+    // ---- startup guard, all combos ----
 
     #[test]
     fn release_mock_no_escape_is_fatal() {
         let c = cfg(true, TeeProviderKind::Mock, VerifierKind::Mock);
         let err = startup_attestation_decision(true, &c, false).unwrap_err();
         assert!(err.0.contains("refusing to start"));
-        assert!(err.0.contains("ZERO security"));
+        assert!(err.0.contains("no security"));
     }
 
     #[test]

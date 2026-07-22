@@ -1,12 +1,12 @@
 // Docker label discovery (Traefik-style). Polls the Docker socket, reads
 // `archetype.*` labels off running containers, maps them to Routes.
 //
-// SECURITY: requires access to the Docker socket = root-equivalent on the host.
-// Gated behind `[discovery] docker = true` (default OFF). Prefer a read-only
+// Security: access to the Docker socket is root-equivalent on the host. Gated
+// behind `[discovery] docker = true` (off by default). Prefer a read-only
 // docker-socket-proxy. See README.
 //
-// Resilience: if the socket is absent or Docker is down, we log a warning and
-// keep polling; the proxy continues serving file/env routes. We never panic.
+// If the socket is absent or Docker is down, the provider logs a warning and
+// keeps polling; the proxy continues serving file/env routes.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -33,7 +33,6 @@ impl DockerProvider {
     }
 
     fn connect(&self) -> Result<Docker, bollard::errors::Error> {
-        // `unix://` and `http://`/`tcp://` both supported via connect_with_*.
         match socket_kind(&self.socket) {
             SocketKind::Unix => {
                 Docker::connect_with_unix(&self.socket, 120, bollard::API_DEFAULT_VERSION)
@@ -91,9 +90,9 @@ impl DiscoveryProvider for DockerProvider {
     }
 
     async fn run(self: Box<Self>, tx: mpsc::Sender<ProviderUpdate>) {
-        // Connect lazily INSIDE the loop so a socket that appears after startup
-        // (Docker installed/started later) is picked up on a later poll. We
-        // never give up; the proxy keeps serving file/env routes throughout.
+        // Connect lazily in the loop so a socket that appears after startup is
+        // picked up on a later poll. The provider retries indefinitely; the
+        // proxy serves file/env routes meanwhile.
         let mut docker: Option<Docker> = None;
         let mut last: Option<Vec<Route>> = None;
         let mut warned_connect = false;
@@ -131,14 +130,14 @@ impl DiscoveryProvider for DockerProvider {
                             .await
                             .is_err()
                         {
-                            return; // manager gone
+                            return; // route manager dropped the receiver
                         }
                         last = Some(routes);
                     }
                 }
                 Err(e) => {
-                    // Drop the client so we re-connect on the next iteration
-                    // (handles daemon restarts / dropped sockets).
+                    // Drop the client; the next iteration reconnects, handling
+                    // daemon restarts and dropped sockets.
                     tracing::warn!(error = %e, "docker discovery poll failed; will reconnect and retry");
                     docker = None;
                 }

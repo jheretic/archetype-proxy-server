@@ -20,20 +20,13 @@ use archetype_proxy_server::proxy::{ProxyState, build_router};
 
 #[tokio::main]
 async fn main() {
-    // Install aws-lc-rs as the PROCESS-DEFAULT rustls CryptoProvider before any
-    // TLS client/server (reqwest, instant-acme, axum-server) is constructed.
-    // The dep tree enables multiple rustls crypto features, so without an
-    // explicit default rustls has no unambiguous provider; pinning it here
-    // keeps the whole process on aws-lc-rs (no `ring` as a crypto provider) and
-    // removes the per-config ambiguity for the ACME + TLS-ALPN paths.
+    // Pin the rustls crypto provider before any TLS client or server is built;
+    // the dependency tree enables more than one, leaving no unambiguous default.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("install aws-lc-rs as the process-default rustls CryptoProvider");
 
-    // clap exits non-zero on a bad/missing value (CLI is highest-precedence;
-    // a bad value must NOT silently fall back to env/file/default). Parsed
-    // BEFORE tracing init so `--log-level`/`-v` can set the default filter
-    // directive (RUST_LOG still overrides -- see below).
+    // Parsed before tracing init so --log-level/-v can set the default filter.
     let args = Args::parse();
 
     tracing_subscriber::fmt()
@@ -51,13 +44,11 @@ async fn main() {
         }
     };
 
-    // `dump` subcommand: print resolved config + provenance and exit.
     if args.dump() {
         print!("{}", config.dump());
         return;
     }
 
-    // Provenance at startup for debuggability.
     tracing::debug!("resolved config:\n{}", config.dump());
     tracing::info!(
         listen = %config.r#static.server.listen,
@@ -69,8 +60,6 @@ async fn main() {
         "archetype-proxy-server starting"
     );
 
-    // No-mock-in-release guard (task #7, headline safety deliverable). The
-    // policy lives in a pure, unit-tested function; here we only act on it.
     let atb_cfg = &config.r#static.attestation;
     let is_release = attestation::is_release_build();
     let insecure_dev = attestation::insecure_dev_env_set();
@@ -86,20 +75,20 @@ async fn main() {
             warn_insecure_mode(atb_cfg, release);
         }
         Err(e) => {
-            tracing::error!(error = %e, "FATAL: attestation startup guard refused to boot");
+            tracing::error!(error = %e, "attestation startup guard refused to boot");
             eprintln!("\nerror: {e}\n");
             std::process::exit(1);
         }
     }
 
-    // Surface the crate's own mock-fallback signal so it is never silently
-    // swallowed: detect_best_provider / MockTeeProvider log a security=true
-    // ERROR on fallback; mirror it loudly at our level too.
+    warn_tpm_unpinned_ak(atb_cfg);
+
+    // Surface openhttpa-tee's own mock-fallback signal at our level.
     openhttpa_tee::telemetry::register_fallback_hook(|reason| {
         tracing::error!(
             security = true,
             %reason,
-            "INSECURE/MOCK MODE: openhttpa-tee fell back to a mock provider"
+            "insecure: openhttpa-tee fell back to a mock provider"
         );
     });
 
@@ -130,9 +119,6 @@ async fn main() {
         true,
     ));
 
-    // BLOCKER B: build the registry with the configured capacity and AtB TTL,
-    // then actively reap expired single-use sessions on a background task so a
-    // long-running bridge doing >>capacity requests never exhausts it.
     let atb = &config.r#static.attestation;
     let metrics = Metrics::new();
     let registry = AtbRegistry::with_capacity(atb.atb_max_sessions);
@@ -144,8 +130,7 @@ async fn main() {
         .with_atb_ttl(Duration::from_secs(atb.atb_ttl_secs));
     let base_router = builder.build();
 
-    // Keep the JoinHandle for the server's lifetime so the eviction task is not
-    // dropped/cancelled.
+    // Hold the handle so the eviction task is not cancelled.
     let _eviction_handle =
         registry.start_eviction_task(Duration::from_secs(atb.atb_eviction_interval_secs));
     tracing::info!(
@@ -195,15 +180,9 @@ async fn main() {
         ));
     }
 
-    // TLS posture (task #11 + #12): when `[server.tls]` is set, terminate
-    // public transport TLS in-process via axum-server + rustls (aws-lc-rs
-    // backend). The cert comes from EXACTLY ONE source — static PEM files or
-    // ACME auto-provisioning — resolved + validated by `TlsConfig::validate`
-    // (mutually exclusive; fail-fast). This is the OUTER listener TLS; the
-    // attested OpenHTTPA session (inner E2E channel) is unaffected. When
-    // absent, bind plain HTTP (run behind a TLS-terminating ingress).
-    // FAIL-FAST: a bad cert/key or ACME failure aborts startup — never a
-    // silent plaintext fallback on a TLS-labelled port.
+    // With [server.tls], terminate public TLS here from one cert source (static
+    // files or ACME); otherwise bind plaintext and expect TLS at an ingress. A
+    // cert/key or ACME failure aborts rather than falling back to plaintext.
     let addr = config.r#static.server.listen;
     if let Some(tls) = &config.r#static.server.tls {
         use archetype_proxy_server::config::TlsMode;
@@ -233,8 +212,7 @@ async fn main() {
                     Err(e) => {
                         tracing::error!(
                             error = %e, %cert_path, %key_path,
-                            "FATAL: failed to load [server.tls] certificate/key; refusing to \
-                             start (will not serve plaintext on a TLS-labelled port)"
+                            "failed to load [server.tls] certificate/key; refusing to start"
                         );
                         eprintln!("\nerror: {e}\n");
                         std::process::exit(1);
@@ -242,7 +220,7 @@ async fn main() {
                 }
             }
             TlsMode::Acme(acme_cfg) => {
-                setup_acme(acme_cfg, addr).await
+                setup_acme(*acme_cfg, addr).await
             }
         };
 
@@ -262,14 +240,10 @@ async fn main() {
     }
 }
 
-/// Provision the public-facing TLS certificate via ACME (task #12) and return
-/// the rustls `ServerConfig` the listener binds — the same type the static
-/// branch produces, so the bind code is shared. The cert lives in an
-/// `AcmeResolver` that is hot-swapped on renewal, so the returned config keeps
-/// serving fresh certs without a restart.
-///
-/// FAIL-FAST: if there is no usable cached cert and live issuance fails, this
-/// aborts startup (it never falls back to plaintext or an expired cert).
+/// Provision the ACME certificate and return the listener's rustls config (same
+/// type as the static branch, so the bind code is shared). The cert lives in an
+/// `AcmeResolver` that is swapped on renewal without a restart. Aborts startup
+/// if there is no cached cert and issuance fails.
 async fn setup_acme(
     acme_cfg: archetype_proxy_server::config::AcmeConfig,
     addr: std::net::SocketAddr,
@@ -280,14 +254,21 @@ async fn setup_acme(
 
     let resolver = Arc::new(AcmeResolver::empty());
     let http_tokens = Http01Tokens::new();
-    let manager = Arc::new(AcmeManager::new(
+    let manager = match AcmeManager::new(
         acme_cfg.clone(),
         resolver.clone(),
         http_tokens.clone(),
-    ));
+    ) {
+        Ok(m) => Arc::new(m),
+        Err(e) => {
+            tracing::error!(error = %e, "ACME manager setup failed; refusing to start");
+            eprintln!("\nerror: ACME setup failed: {e}\n");
+            std::process::exit(1);
+        }
+    };
 
-    // HTTP-01: the CA fetches the key-authorization from a plaintext listener
-    // DURING issuance, so it must be up BEFORE we call `issue()`.
+    // The CA fetches the HTTP-01 key-authorization during issuance, so the
+    // responder must be listening before issue() runs.
     if acme_cfg.challenge == AcmeChallenge::Http01 {
         let listen = acme_cfg
             .http01_listen
@@ -295,8 +276,6 @@ async fn setup_acme(
         spawn_http01_responder(listen, http_tokens.clone());
     }
 
-    // Reuse a still-valid cached cert if present; otherwise issue now and
-    // FAIL-FAST on error.
     if manager.load_cached() {
         tracing::info!(%addr, domains = ?acme_cfg.domains, "listening (TLS; ACME cached cert)");
     } else if let Err(e) = manager.issue().await {
@@ -304,8 +283,7 @@ async fn setup_acme(
             error = %e,
             domains = ?acme_cfg.domains,
             challenge = %acme_cfg.challenge,
-            "FATAL: ACME certificate issuance failed; refusing to start (will not \
-             serve plaintext on a TLS-labelled port)"
+            "ACME certificate issuance failed; refusing to start"
         );
         eprintln!("\nerror: ACME issuance failed: {e}\n");
         std::process::exit(1);
@@ -318,18 +296,13 @@ async fn setup_acme(
         );
     }
 
-    // Background renewal for the process lifetime. tokio detaches the task on
-    // handle drop (it is NOT cancelled), and the `Arc<AcmeManager>` moved in
-    // keeps the manager alive.
     tokio::spawn(manager.renewal_loop());
 
     let acme_tls_alpn = matches!(acme_cfg.challenge, AcmeChallenge::TlsAlpn01);
     tls::config_with_resolver(resolver, acme_tls_alpn)
 }
 
-/// Spawn the minimal plaintext HTTP-01 responder. It serves the in-flight
-/// key-authorization for `GET /.well-known/acme-challenge/{token}` (404 when
-/// no challenge is active for that token). Only spawned for challenge=http-01.
+/// Serve the HTTP-01 key-authorization at `/.well-known/acme-challenge/{token}`.
 fn spawn_http01_responder(
     listen: std::net::SocketAddr,
     tokens: archetype_proxy_server::acme::Http01Tokens,
@@ -365,7 +338,7 @@ fn spawn_http01_responder(
             Err(e) => {
                 tracing::error!(
                     error = %e, %listen,
-                    "FATAL: failed to bind ACME HTTP-01 responder; refusing to start"
+                    "failed to bind ACME HTTP-01 responder; refusing to start"
                 );
                 std::process::exit(1);
             }
@@ -373,9 +346,7 @@ fn spawn_http01_responder(
     });
 }
 
-/// Emit the LOUD multi-line banner when mock attestation is in effect. In a
-/// release build (escape hatch was required to reach here) the warning is
-/// extra prominent.
+/// Warn that mock attestation is active.
 fn warn_insecure_mode(cfg: &archetype_proxy_server::config::AttestationConfig, release: bool) {
     let profile = if release { "RELEASE" } else { "debug" };
     tracing::error!(
@@ -398,4 +369,27 @@ fn warn_insecure_mode(cfg: &archetype_proxy_server::config::AttestationConfig, r
             "running a {profile} build with mock attestation because {INSECURE_DEV_ENV}=1 was set"
         );
     }
+}
+
+/// Warn loudly when a TPM verifier is configured to accept an unpinned,
+/// unchained AK. In that mode the AK's authenticity is not verified.
+fn warn_tpm_unpinned_ak(cfg: &archetype_proxy_server::config::AttestationConfig) {
+    use archetype_proxy_server::config::VerifierKind;
+    let unpinned = matches!(cfg.verifier, VerifierKind::Tpm)
+        && cfg.tpm.as_ref().is_some_and(|t| t.allow_unpinned_ak);
+    if !unpinned {
+        return;
+    }
+    tracing::error!(
+        security = true,
+        verifier = %cfg.verifier,
+        "\n\
+        ============================================================\n\
+        ==  TPM allow_unpinned_ak = true  ==========================\n\
+        ==  The TPM attestation key (AK) is NOT authenticated: it  ==\n\
+        ==  is neither pinned nor chained to a trusted EK root, so ==\n\
+        ==  any AK is accepted. Boot-state (PCR) checks still run, ==\n\
+        ==  but a rogue TPM/AK cannot be detected. DEV/TEST ONLY.  ==\n\
+        ============================================================"
+    );
 }

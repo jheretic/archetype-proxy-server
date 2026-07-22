@@ -1,11 +1,11 @@
-// Layered, Traefik-style configuration (task #6).
+// Layered, Traefik-style configuration.
 //
 // Two tiers:
-//   * STATIC  -- file/env/CLI only, read once at boot: how the proxy boots and
-//                which discovery providers are enabled (server, attestation,
-//                discovery). Does NOT hot-reload.
-//   * DYNAMIC -- the set of attested routes (match rule -> upstream). Sourced
-//                from the file AND/OR discovery providers; hot-reloadable.
+//   * Static: file/env/CLI only, read once at boot: how the proxy boots and
+//     which discovery providers are enabled (server, attestation, discovery).
+//     Not hot-reloaded.
+//   * Dynamic: the set of attested routes (match rule -> upstream). Sourced
+//     from the file and/or discovery providers; hot-reloadable.
 //
 // Precedence for a resolved field (highest wins):
 //   CLI flag > env (ARCHETYPE_PROXY_*) > discovered > TOML file > built-in default.
@@ -28,7 +28,7 @@ const DEFAULT_ATB_MAX_SESSIONS: usize = 10_000;
 const DEFAULT_TEE_PROVIDER: TeeProviderKind = TeeProviderKind::Mock;
 const DEFAULT_VERIFIER: VerifierKind = VerifierKind::Mock;
 // Per-IP sliding-window rate limit defaults (applied to attested routes).
-const DEFAULT_RATE_LIMIT_MAX_REQUESTS: usize = 0; // 0 = disabled
+const DEFAULT_RATE_LIMIT_MAX_REQUESTS: usize = 0; // disabled
 const DEFAULT_RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const ENV_CONFIG_PATH: &str = "ARCHETYPE_PROXY_CONFIG";
 const DEFAULT_CONFIG_PATH: &str = "./archetype-proxy.toml";
@@ -84,10 +84,10 @@ pub fn parse_bool_token(s: &str) -> Option<bool> {
 }
 
 // ---------------------------------------------------------------------------
-// TEE provider / verifier selection (task #7)
+// TEE provider / verifier selection
 // ---------------------------------------------------------------------------
 
-/// Which TEE attestation PROVIDER the server generates quotes with. Real
+/// Which TEE attestation provider the server generates quotes with. Real
 /// variants only build under the matching cargo feature on this crate (see
 /// `Cargo.toml`); selecting one at runtime without its feature compiled in is
 /// a fatal startup error (see `attestation::build_tee_provider`).
@@ -99,9 +99,11 @@ pub enum TeeProviderKind {
     Sgx,
     TrustZone,
     AwsNitro,
+    /// TPM 2.0 measured-boot quote (real provider under the `tpm` feature).
+    Tpm,
 }
 
-/// Which quote VERIFIER the server validates client/peer quotes with.
+/// Which quote verifier the server validates client/peer quotes with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifierKind {
     Mock,
@@ -134,6 +136,7 @@ impl TeeProviderKind {
             Self::Sgx => "sgx",
             Self::TrustZone => "trustzone",
             Self::AwsNitro => "aws_nitro",
+            Self::Tpm => "tpm",
         }
     }
 }
@@ -168,8 +171,9 @@ impl std::str::FromStr for TeeProviderKind {
             "sgx" => Ok(Self::Sgx),
             "trustzone" | "trust_zone" => Ok(Self::TrustZone),
             "aws_nitro" | "nitro" => Ok(Self::AwsNitro),
+            "tpm" => Ok(Self::Tpm),
             other => Err(format!(
-                "unknown tee_provider {other:?} (expected mock|tdx|sev_snp|sgx|trustzone|aws_nitro)"
+                "unknown tee_provider {other:?} (expected mock|tdx|sev_snp|sgx|trustzone|aws_nitro|tpm)"
             )),
         }
     }
@@ -219,12 +223,12 @@ impl<'de> Deserialize<'de> for VerifierKind {
     }
 }
 
-/// Public-facing TLS termination config (task #7 hook). Optional; see README
-/// for the supported posture. Reused as the file representation.
+/// Public-facing TLS termination config. Optional; see README for the
+/// supported posture. Reused as the file representation.
 ///
-/// Two MUTUALLY EXCLUSIVE cert sources: static PEM files (`cert_path` +
-/// `key_path`) OR ACME auto-provisioning (`[server.tls.acme] enabled=true`).
-/// `validate()` enforces exactly-one and is called at startup (fail-fast).
+/// Two mutually exclusive cert sources: static PEM files (`cert_path` +
+/// `key_path`) or ACME auto-provisioning (`[server.tls.acme] enabled=true`).
+/// `validate()` enforces exactly one and is called at startup.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
@@ -235,7 +239,7 @@ pub struct TlsConfig {
 }
 
 /// Which ACME challenge type to use. DNS-01 is the only type that can issue
-/// WILDCARD certs.
+/// wildcard certs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AcmeChallenge {
     /// Validation cert served on the existing :443 TLS listener (no extra port).
@@ -286,13 +290,14 @@ impl<'de> Deserialize<'de> for AcmeChallenge {
 }
 
 /// Which DNS provider publishes the `_acme-challenge` TXT record for DNS-01.
-/// Only `Manual` (hook command / poll-until-present) is implemented; specific
-/// APIs (Cloudflare/Route53/etc.) are pluggable follow-ups via the
-/// `acme::DnsProvider` trait.
+/// `Manual` runs a hook command (or logs and waits); `Cloudflare` publishes
+/// the record via the Cloudflare API. Further APIs (Route53/etc.) are
+/// pluggable follow-ups via the `acme::DnsProvider` trait.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DnsProviderKind {
     #[default]
     Manual,
+    Cloudflare,
 }
 
 impl DnsProviderKind {
@@ -300,6 +305,7 @@ impl DnsProviderKind {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Manual => "manual",
+            Self::Cloudflare => "cloudflare",
         }
     }
 }
@@ -309,9 +315,9 @@ impl std::str::FromStr for DnsProviderKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
             "manual" | "hook" => Ok(Self::Manual),
+            "cloudflare" | "cf" => Ok(Self::Cloudflare),
             other => Err(format!(
-                "unknown dns provider {other:?} (expected manual; \
-                 cloudflare/route53/etc. are follow-ups)"
+                "unknown dns provider {other:?} (expected manual|cloudflare)"
             )),
         }
     }
@@ -336,12 +342,21 @@ impl<'de> Deserialize<'de> for DnsProviderKind {
 pub struct AcmeDnsConfig {
     #[serde(default)]
     pub provider: DnsProviderKind,
-    /// External command run to PUBLISH the TXT record. Receives the record
+    /// External command run to publish the TXT record. Receives the record
     /// name + value via env (`ACME_DNS_NAME`, `ACME_DNS_VALUE`, `ACME_DNS_DOMAIN`).
     /// If unset, the record is logged and the manager polls DNS until present.
     pub hook_command: Option<String>,
-    /// External command run to CLEAN UP the TXT record after validation.
+    /// External command run to clean up the TXT record after validation.
     pub cleanup_command: Option<String>,
+    /// Cloudflare API token (provider = "cloudflare"). Inline works but is
+    /// discouraged; prefer `api_token_env`.
+    pub api_token: Option<String>,
+    /// Name of an environment variable holding the Cloudflare API token. Read
+    /// at startup; recommended over an inline `api_token`.
+    pub api_token_env: Option<String>,
+    /// Explicit Cloudflare zone id. If absent, the provider auto-discovers the
+    /// zone by name (needs the token to have Zone:Read).
+    pub zone_id: Option<String>,
     /// Seconds to wait for DNS propagation before telling the CA to validate.
     #[serde(default = "default_dns_propagation_secs")]
     pub propagation_secs: u64,
@@ -353,6 +368,9 @@ impl Default for AcmeDnsConfig {
             provider: DnsProviderKind::Manual,
             hook_command: None,
             cleanup_command: None,
+            api_token: None,
+            api_token_env: None,
+            zone_id: None,
             propagation_secs: default_dns_propagation_secs(),
         }
     }
@@ -362,7 +380,23 @@ const fn default_dns_propagation_secs() -> u64 {
     60
 }
 
-/// ACME automatic-TLS config (task #12). Off by default.
+impl AcmeDnsConfig {
+    /// Resolve the Cloudflare API token: an inline `api_token` if set,
+    /// otherwise the value of the env var named by `api_token_env`. Returns
+    /// `None` if neither yields a non-empty value.
+    #[must_use]
+    pub fn resolve_cf_token(&self) -> Option<String> {
+        if let Some(t) = self.api_token.as_deref()
+            && !t.is_empty()
+        {
+            return Some(t.to_owned());
+        }
+        let var = self.api_token_env.as_deref()?;
+        std::env::var(var).ok().filter(|t| !t.is_empty())
+    }
+}
+
+/// ACME automatic-TLS config. Off by default.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcmeConfig {
@@ -396,14 +430,14 @@ pub enum TlsMode {
         cert_path: String,
         key_path: String,
     },
-    Acme(AcmeConfig),
+    Acme(Box<AcmeConfig>),
 }
 
 impl TlsConfig {
-    /// Classify + validate the `[server.tls]` block into exactly one cert
-    /// source. FAIL-FAST: returns a clear error string (no silent fallback) if
-    /// the static pair and ACME are both/neither configured, if the static
-    /// pair is half-specified, or if ACME is enabled with no domains.
+    /// Classify and validate the `[server.tls]` block into exactly one cert
+    /// source. Returns an error string if the static pair and ACME are both or
+    /// neither configured, if the static pair is half-specified, or if ACME is
+    /// enabled with no domains.
     pub fn validate(&self) -> Result<TlsMode, String> {
         let acme_enabled = self.acme.as_ref().is_some_and(|a| a.enabled);
         let has_static = self.cert_path.is_some() || self.key_path.is_some();
@@ -448,13 +482,13 @@ impl TlsConfig {
                         acme.challenge
                     ));
                 }
-                Ok(TlsMode::Acme(acme.clone()))
+                Ok(TlsMode::Acme(Box::new(acme.clone())))
             }
         }
     }
 }
 
-/// field-path -> winning layer, for debuggability.
+/// Field-path -> winning layer.
 #[derive(Debug, Clone, Default)]
 pub struct Provenance(BTreeMap<String, Source>);
 
@@ -496,25 +530,115 @@ pub struct ServerConfig {
 #[derive(Debug, Clone)]
 pub struct AttestationConfig {
     pub allow_mock: bool,
-    /// Global default for per-route strict attestation. Enforcement is task #7;
-    /// this is parsed and threaded through but not yet acted upon.
+    /// Global default for per-route strict attestation. Parsed and threaded
+    /// through but not yet enforced.
     pub strict_attestation: bool,
     pub atb_ttl_secs: u64,
-    /// Background eviction interval for the AtB registry (BLOCKER B). Expired
-    /// single-use sessions are reaped on this cadence so a long-running bridge
-    /// doing >>capacity requests does not exhaust the registry.
+    /// Background eviction interval for the AtB registry. Expired single-use
+    /// sessions are reaped on this cadence so a long-running bridge doing more
+    /// requests than the capacity does not exhaust the registry.
     pub atb_eviction_interval_secs: u64,
     /// Max live AtB sessions held by the registry (capacity).
     pub atb_max_sessions: usize,
-    /// TEE provider used to generate quotes (task #7). Real variants require
-    /// the matching cargo feature on this crate.
+    /// TEE provider used to generate quotes. Real variants require the matching
+    /// cargo feature on this crate.
     pub tee_provider: TeeProviderKind,
-    /// Quote verifier used to validate quotes (task #7).
+    /// Quote verifier used to validate quotes.
     pub verifier: VerifierKind,
     /// REST endpoint for remote verifiers (MAA / ITA).
     pub verifier_endpoint: Option<String>,
     /// API key for verifiers that need one (ITA).
     pub verifier_api_key: Option<String>,
+    /// TPM measured-boot reference policy. Required (non-empty `expected_pcrs`)
+    /// when `verifier` or `tee_provider` is `tpm`; ignored otherwise.
+    pub tpm: Option<TpmConfig>,
+}
+
+/// Resolved `[attestation.tpm]` reference policy. Hex strings from the file/env
+/// layers are decoded to bytes at load time so a malformed value is a clear
+/// config error rather than a runtime verifier failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmConfig {
+    /// Expected PCR values: index -> raw digest bytes (SHA-256 = 32 bytes). The
+    /// verifier reconstructs the composite digest from these in ascending index
+    /// order and compares it to the signed `pcrDigest`.
+    pub expected_pcrs: BTreeMap<u32, Vec<u8>>,
+    /// Optional pinned AK public key as uncompressed SEC1 (`0x04 || X || Y`)
+    /// bytes. When set, the AK in the evidence must byte-match this value
+    /// (trust-on-first-use substitute for full EK->AK cert-chain validation).
+    pub pinned_ak_sec1: Option<Vec<u8>>,
+    /// Optional PCR selection (indices) the provider quotes. `None` uses the
+    /// provider default (SHA-256 PCRs 0-7). Advisory for the provider; the
+    /// verifier's authority is `expected_pcrs`.
+    pub pcr_selection: Option<Vec<u32>>,
+    /// Paths to PEM or DER X.509 certificate files for trusted TPM-manufacturer
+    /// / EK root CAs. When non-empty, an AK that is not pinned may still be
+    /// accepted if its certificate chain (carried in the evidence) walks up to
+    /// one of these roots. Decoded to DER at startup (`trusted_ek_roots_der`).
+    pub trusted_ek_root_paths: Vec<String>,
+    /// Accept an AK that is neither pinned nor backed by a valid chain to a
+    /// trusted EK root. Insecure dev/test opt-out; `false` (fail closed) by
+    /// default. When `true` the AK's authenticity is not verified.
+    pub allow_unpinned_ak: bool,
+}
+
+impl TpmConfig {
+    /// Read and DER-decode every configured trusted EK root certificate.
+    /// Accepts PEM (armored base64) and raw DER files. Fails with a clear
+    /// error naming the offending file if it cannot be read or parsed.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] on an unreadable or unparseable certificate file.
+    pub fn trusted_ek_roots_der(&self) -> Result<Vec<Vec<u8>>, ConfigError> {
+        let mut out = Vec::new();
+        for path in &self.trusted_ek_root_paths {
+            out.extend(load_cert_der(path)?);
+        }
+        Ok(out)
+    }
+}
+
+/// Read an X.509 certificate file and return its DER-encoded certificate(s).
+/// A file containing the `-----BEGIN` PEM armor is parsed as one or more PEM
+/// certificates; otherwise the file is treated as a single raw DER certificate.
+/// Each resulting certificate is DER-validated so a malformed file is a clear
+/// startup error rather than a runtime verifier failure.
+fn load_cert_der(path: &str) -> Result<Vec<Vec<u8>>, ConfigError> {
+    use x509_parser::prelude::{FromDer, X509Certificate};
+
+    let bytes = std::fs::read(path).map_err(|source| ConfigError::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+
+    let ders: Vec<Vec<u8>> = if bytes.windows(11).any(|w| w == b"-----BEGIN ") {
+        let mut reader = std::io::BufReader::new(&bytes[..]);
+        let certs = rustls_pemfile::certs(&mut reader)
+            .map(|r| r.map(|c| c.to_vec()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                ConfigError::Validation(format!(
+                    "trusted EK root {path}: failed to parse PEM certificate(s): {e}"
+                ))
+            })?;
+        if certs.is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "trusted EK root {path}: no PEM certificate found"
+            )));
+        }
+        certs
+    } else {
+        vec![bytes]
+    };
+
+    for der in &ders {
+        X509Certificate::from_der(der).map_err(|e| {
+            ConfigError::Validation(format!(
+                "trusted EK root {path}: not a valid X.509 certificate: {e}"
+            ))
+        })?;
+    }
+    Ok(ders)
 }
 
 #[derive(Debug, Clone)]
@@ -558,7 +682,7 @@ pub struct Route {
     pub path_prefix: String,
     /// Upstream base URL, e.g. `http://api:8080`.
     pub upstream: String,
-    /// Per-route strict attestation override. Enforcement is task #7.
+    /// Per-route strict attestation override. Not yet enforced.
     pub strict_attestation: Option<bool>,
     /// Which layer produced this route.
     pub source: Source,
@@ -588,7 +712,7 @@ impl Route {
 /// Path-prefix match on segment boundaries. Empty/"/" prefix is a catch-all.
 /// Otherwise `path` matches iff it equals the prefix (trailing slash ignored)
 /// or begins with the prefix followed by `/` — so `/v1` matches `/v1` and
-/// `/v1/foo` but NOT `/v123` or `/v1evil`.
+/// `/v1/foo` but not `/v123` or `/v1evil`.
 fn path_prefix_matches(prefix: &str, path: &str) -> bool {
     let p = prefix.trim_end_matches('/');
     if p.is_empty() {
@@ -712,6 +836,49 @@ impl Config {
         );
         line(
             &mut out,
+            "attestation.tpm.expected_pcrs",
+            s.attestation.tpm.as_ref().map_or_else(
+                || "<none>".to_owned(),
+                |t| {
+                    let idxs: Vec<String> =
+                        t.expected_pcrs.keys().map(u32::to_string).collect();
+                    format!("{} PCR(s) [{}]", t.expected_pcrs.len(), idxs.join(","))
+                },
+            ),
+        );
+        line(
+            &mut out,
+            "attestation.tpm.pinned_ak",
+            s.attestation.tpm.as_ref().map_or_else(
+                || "<none>".to_owned(),
+                |t| {
+                    if t.pinned_ak_sec1.is_some() {
+                        "<set>".to_owned()
+                    } else {
+                        "<none>".to_owned()
+                    }
+                },
+            ),
+        );
+        line(
+            &mut out,
+            "attestation.tpm.trusted_ek_roots",
+            s.attestation.tpm.as_ref().map_or_else(
+                || "<none>".to_owned(),
+                |t| t.trusted_ek_root_paths.len().to_string(),
+            ),
+        );
+        line(
+            &mut out,
+            "attestation.tpm.allow_unpinned_ak",
+            s.attestation
+                .tpm
+                .as_ref()
+                .is_some_and(|t| t.allow_unpinned_ak)
+                .to_string(),
+        );
+        line(
+            &mut out,
             "server.tls",
             s.server.tls.as_ref().map_or_else(
                 || "<none>".to_owned(),
@@ -798,22 +965,23 @@ pub struct PartialStatic {
     pub verifier: Option<VerifierKind>,
     pub verifier_endpoint: Option<String>,
     pub verifier_api_key: Option<String>,
+    pub tpm: Option<TpmConfig>,
     pub rate_limit_max_requests: Option<usize>,
     pub rate_limit_window_secs: Option<u64>,
     pub docker_enabled: Option<bool>,
     pub docker_socket: Option<String>,
     pub docker_poll_secs: Option<u64>,
     pub kubernetes_enabled: Option<bool>,
-    /// Three-state so a higher layer can explicitly CLEAR an optional value:
+    /// Three-state so a higher layer can explicitly clear an optional value:
     ///   None        = layer is silent
     ///   Some(None)  = layer clears the namespace (all namespaces)
     ///   Some(Some)  = layer sets a specific namespace
-    /// An empty string in file/env/CLI means Clear (all namespaces).
+    /// An empty string in file/env/CLI clears the namespace (all namespaces).
     pub kubernetes_namespace: Option<Option<String>>,
 }
 
-/// Map a raw optional string from one layer into a namespace `LayerValue`:
-/// absent => silent, empty string => Clear (all namespaces), else => Set.
+/// Map a raw optional string from one layer into a namespace override: absent
+/// => silent, empty string => clear (all namespaces), else => set.
 fn namespace_layer(v: Option<String>) -> Option<Option<String>> {
     v.map(|s| if s.is_empty() { None } else { Some(s) })
 }
@@ -833,7 +1001,7 @@ struct FileConfig {
     rate_limit: FileRateLimit,
     #[serde(default)]
     discovery: FileDiscovery,
-    // Backwards-compat: the MVP `[upstream] target` single static upstream.
+    // Backwards-compat: the `[upstream] target` single static upstream.
     #[serde(default)]
     upstream: Option<FileUpstream>,
     #[serde(default, rename = "route")]
@@ -861,6 +1029,67 @@ struct FileAttestation {
     verifier: Option<VerifierKind>,
     verifier_endpoint: Option<String>,
     verifier_api_key: Option<String>,
+    #[serde(default)]
+    tpm: Option<FileTpm>,
+}
+
+/// File representation of `[attestation.tpm]`. Values are hex strings decoded
+/// to bytes at load (`FileTpm::resolve`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileTpm {
+    /// Map of PCR index (TOML keys are always strings; parsed to `u32` in
+    /// [`FileTpm::resolve`]) -> hex-encoded digest.
+    #[serde(default)]
+    expected_pcrs: BTreeMap<String, String>,
+    #[serde(default)]
+    pinned_ak_sec1_hex: Option<String>,
+    #[serde(default)]
+    pcr_selection: Option<Vec<u32>>,
+    #[serde(default)]
+    trusted_ek_root_paths: Vec<String>,
+    #[serde(default)]
+    allow_unpinned_ak: bool,
+}
+
+impl FileTpm {
+    /// Decode hex fields into a resolved [`TpmConfig`]. Fails with a clear
+    /// error naming the offending field/index on bad hex.
+    fn resolve(self) -> Result<TpmConfig, ConfigError> {
+        let mut expected_pcrs = BTreeMap::new();
+        for (idx_str, hex_str) in self.expected_pcrs {
+            let idx: u32 = idx_str.trim().parse().map_err(|e| ConfigError::Env {
+                var: "attestation.tpm.expected_pcrs".to_owned(),
+                value: idx_str.clone(),
+                reason: format!("invalid PCR index: {e}"),
+            })?;
+            let bytes = decode_hex_field(&hex_str, &format!(
+                "attestation.tpm.expected_pcrs[{idx}]"
+            ))?;
+            expected_pcrs.insert(idx, bytes);
+        }
+        let pinned_ak_sec1 = match self.pinned_ak_sec1_hex {
+            Some(h) => Some(decode_hex_field(&h, "attestation.tpm.pinned_ak_sec1_hex")?),
+            None => None,
+        };
+        Ok(TpmConfig {
+            expected_pcrs,
+            pinned_ak_sec1,
+            pcr_selection: self.pcr_selection,
+            trusted_ek_root_paths: self.trusted_ek_root_paths,
+            allow_unpinned_ak: self.allow_unpinned_ak,
+        })
+    }
+}
+
+/// Decode a hex string into bytes, mapping errors to a `ConfigError::Env`-style
+/// message that names the config field.
+fn decode_hex_field(value: &str, field: &str) -> Result<Vec<u8>, ConfigError> {
+    hex::decode(value.trim()).map_err(|e| ConfigError::Env {
+        var: field.to_owned(),
+        value: value.to_owned(),
+        reason: format!("expected hex: {e}"),
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -920,6 +1149,8 @@ pub enum ConfigError {
         value: String,
         reason: String,
     },
+    #[error("invalid configuration: {0}")]
+    Validation(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -927,7 +1158,7 @@ pub enum ConfigError {
 // ---------------------------------------------------------------------------
 
 /// Pick the highest-precedence `Some` value across the layers, recording its
-/// source. `layers` is ordered LOWEST -> HIGHEST precedence.
+/// source. `layers` is ordered lowest to highest precedence.
 fn resolve<T: Clone>(
     field: &str,
     default: T,
@@ -961,7 +1192,69 @@ impl Config {
         let path = Self::config_path(config_path);
         let file = Self::read_file(&path)?;
         let env = Self::read_env()?;
-        Ok(Self::resolve_layers(file, env, cli))
+        let cfg = Self::resolve_layers(file, env, cli);
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Cross-field validation applied after layered resolution. Currently
+    /// enforces that a TPM verifier/provider has a non-empty reference policy
+    /// (an empty policy would fail closed at runtime with a confusing error).
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::Validation`] with an actionable message.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let att = &self.r#static.attestation;
+        let uses_tpm = matches!(att.verifier, VerifierKind::Tpm)
+            || matches!(att.tee_provider, TeeProviderKind::Tpm);
+        if uses_tpm {
+            let non_empty = att
+                .tpm
+                .as_ref()
+                .is_some_and(|t| !t.expected_pcrs.is_empty());
+            if !non_empty {
+                return Err(ConfigError::Validation(format!(
+                    "attestation.verifier={} / tee_provider={} requires a non-empty \
+                     [attestation.tpm].expected_pcrs reference policy (map of PCR index -> hex \
+                     digest); an empty policy would fail closed at runtime. Set expected PCRs, \
+                     e.g.\n\n    [attestation.tpm.expected_pcrs]\n    0 = \"<64-hex-sha256>\"\n    ...\n\n\
+                     or via ARCHETYPE_PROXY_TPM_EXPECTED_PCRS=0:<hex>,7:<hex>.",
+                    att.verifier, att.tee_provider
+                )));
+            }
+
+            // The verifier fails closed unless the AK can be trusted. Reject a
+            // TPM config that configures none of the three AK-trust modes at
+            // startup rather than letting every request fail with a confusing
+            // per-request "AK neither pinned nor backed by a trusted chain".
+            let tpm = att.tpm.as_ref().expect("non_empty implies Some");
+            let has_pin = tpm.pinned_ak_sec1.is_some();
+            let has_roots = !tpm.trusted_ek_root_paths.is_empty();
+            if !has_pin && !has_roots && !tpm.allow_unpinned_ak {
+                return Err(ConfigError::Validation(format!(
+                    "attestation.verifier={} / tee_provider={} requires the TPM attestation key \
+                     (AK) to be trusted by exactly one of three modes; none is configured, so \
+                     the verifier would reject every AK at request time. Choose one:\n\
+                     \n  1. Pin the AK public key (uncompressed SEC1, hex):\n\
+                     \n       [attestation.tpm]\n       pinned_ak_sec1_hex = \"04...\"\n\
+                     \n     (or ARCHETYPE_PROXY_TPM_PINNED_AK_SEC1_HEX)\n\
+                     \n  2. Chain the AK to trusted EK/manufacturer root cert(s):\n\
+                     \n       [attestation.tpm]\n       trusted_ek_root_paths = [\"/path/ek-root.pem\"]\n\
+                     \n     (or ARCHETYPE_PROXY_TPM_TRUSTED_EK_ROOT_PATHS)\n\
+                     \n  3. Accept an unpinned AK (INSECURE, dev/test only):\n\
+                     \n       [attestation.tpm]\n       allow_unpinned_ak = true\n\
+                     \n     (or ARCHETYPE_PROXY_TPM_ALLOW_UNPINNED_AK=true)",
+                    att.verifier, att.tee_provider
+                )));
+            }
+
+            // Fail fast on unreadable/unparseable root certs (rather than at
+            // verifier-build time) and name the offending file.
+            if has_roots {
+                tpm.trusted_ek_roots_der()?;
+            }
+        }
+        Ok(())
     }
 
     fn read_file(path: &str) -> Result<(PartialStatic, Vec<Route>), ConfigError> {
@@ -990,6 +1283,10 @@ impl Config {
             verifier: fc.attestation.verifier,
             verifier_endpoint: fc.attestation.verifier_endpoint,
             verifier_api_key: fc.attestation.verifier_api_key,
+            tpm: match fc.attestation.tpm {
+                Some(t) => Some(t.resolve()?),
+                None => None,
+            },
             rate_limit_max_requests: fc.rate_limit.max_requests,
             rate_limit_window_secs: fc.rate_limit.window_secs,
             docker_enabled: fc.discovery.docker,
@@ -1073,18 +1370,116 @@ impl Config {
             verifier: parse("ARCHETYPE_PROXY_VERIFIER")?,
             verifier_endpoint: var("ARCHETYPE_PROXY_VERIFIER_ENDPOINT"),
             verifier_api_key: var("ARCHETYPE_PROXY_VERIFIER_API_KEY"),
+            tpm: Self::read_tpm_env()?,
             rate_limit_max_requests: parse("ARCHETYPE_PROXY_RATE_LIMIT_MAX_REQUESTS")?,
             rate_limit_window_secs: parse("ARCHETYPE_PROXY_RATE_LIMIT_WINDOW_SECS")?,
             docker_enabled: parse_bool("ARCHETYPE_PROXY_DOCKER")?,
             docker_socket: var("ARCHETYPE_PROXY_DOCKER_SOCKET"),
             docker_poll_secs: parse("ARCHETYPE_PROXY_DOCKER_POLL_SECS")?,
             kubernetes_enabled: parse_bool("ARCHETYPE_PROXY_KUBERNETES")?,
-            // Read raw (not via `var`) so an explicit empty value means Clear
-            // (all namespaces) rather than being filtered out as silent.
+            // Read raw (not via `var`) so an explicit empty value clears the
+            // namespace (all namespaces) rather than being filtered as silent.
             kubernetes_namespace: namespace_layer(
                 std::env::var("ARCHETYPE_PROXY_KUBERNETES_NAMESPACE").ok(),
             ),
         })
+    }
+
+    /// Parse `[attestation.tpm]` from env. Uses the same hex-map encoding as the
+    /// file layer but flattened into scalar env vars:
+    ///   * `ARCHETYPE_PROXY_TPM_EXPECTED_PCRS` — comma-separated `index:hex`
+    ///     pairs, e.g. `0:0000...,7:abcd...`.
+    ///   * `ARCHETYPE_PROXY_TPM_PINNED_AK_SEC1_HEX` — hex SEC1 AK.
+    ///   * `ARCHETYPE_PROXY_TPM_PCR_SELECTION` — comma-separated indices.
+    ///   * `ARCHETYPE_PROXY_TPM_TRUSTED_EK_ROOT_PATHS` — cert file paths
+    ///     separated by commas or colons (`:`), each a PEM or DER root cert.
+    ///   * `ARCHETYPE_PROXY_TPM_ALLOW_UNPINNED_AK` — boolean dev/test opt-out.
+    ///
+    /// Returns `None` when none of the vars are set so the env layer stays
+    /// silent and does not clobber a file-provided policy.
+    fn read_tpm_env() -> Result<Option<TpmConfig>, ConfigError> {
+        fn var(name: &str) -> Option<String> {
+            std::env::var(name).ok().filter(|s| !s.is_empty())
+        }
+        let pcrs_raw = var("ARCHETYPE_PROXY_TPM_EXPECTED_PCRS");
+        let ak_raw = var("ARCHETYPE_PROXY_TPM_PINNED_AK_SEC1_HEX");
+        let sel_raw = var("ARCHETYPE_PROXY_TPM_PCR_SELECTION");
+        let roots_raw = var("ARCHETYPE_PROXY_TPM_TRUSTED_EK_ROOT_PATHS");
+        let allow_raw = var("ARCHETYPE_PROXY_TPM_ALLOW_UNPINNED_AK");
+        if pcrs_raw.is_none()
+            && ak_raw.is_none()
+            && sel_raw.is_none()
+            && roots_raw.is_none()
+            && allow_raw.is_none()
+        {
+            return Ok(None);
+        }
+
+        let mut expected_pcrs = BTreeMap::new();
+        if let Some(raw) = pcrs_raw {
+            for pair in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                let (idx_s, hex_s) = pair.split_once(':').ok_or_else(|| ConfigError::Env {
+                    var: "ARCHETYPE_PROXY_TPM_EXPECTED_PCRS".to_owned(),
+                    value: pair.to_owned(),
+                    reason: "expected `index:hex` pairs separated by commas".to_owned(),
+                })?;
+                let idx: u32 = idx_s.trim().parse().map_err(|e| ConfigError::Env {
+                    var: "ARCHETYPE_PROXY_TPM_EXPECTED_PCRS".to_owned(),
+                    value: idx_s.to_owned(),
+                    reason: format!("invalid PCR index: {e}"),
+                })?;
+                let bytes = decode_hex_field(
+                    hex_s,
+                    "ARCHETYPE_PROXY_TPM_EXPECTED_PCRS",
+                )?;
+                expected_pcrs.insert(idx, bytes);
+            }
+        }
+
+        let pinned_ak_sec1 = match ak_raw {
+            Some(h) => Some(decode_hex_field(&h, "ARCHETYPE_PROXY_TPM_PINNED_AK_SEC1_HEX")?),
+            None => None,
+        };
+
+        let pcr_selection = match sel_raw {
+            Some(raw) => {
+                let mut sel = Vec::new();
+                for s in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    sel.push(s.parse::<u32>().map_err(|e| ConfigError::Env {
+                        var: "ARCHETYPE_PROXY_TPM_PCR_SELECTION".to_owned(),
+                        value: s.to_owned(),
+                        reason: format!("invalid PCR index: {e}"),
+                    })?);
+                }
+                Some(sel)
+            }
+            None => None,
+        };
+
+        let trusted_ek_root_paths = roots_raw.map_or_else(Vec::new, |raw| {
+            raw.split([',', ':'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        });
+
+        let allow_unpinned_ak = match allow_raw {
+            None => false,
+            Some(v) => parse_bool_token(&v).ok_or_else(|| ConfigError::Env {
+                var: "ARCHETYPE_PROXY_TPM_ALLOW_UNPINNED_AK".to_owned(),
+                value: v,
+                reason: "expected a boolean".to_owned(),
+            })?,
+        };
+
+        Ok(Some(TpmConfig {
+            expected_pcrs,
+            pinned_ak_sec1,
+            pcr_selection,
+            trusted_ek_root_paths,
+            allow_unpinned_ak,
+        }))
     }
 
     /// Pure merge: visible for testing.
@@ -1154,6 +1549,16 @@ impl Config {
             ],
             &mut prov,
         );
+        let tpm = resolve(
+            "attestation.tpm",
+            None,
+            &[
+                (Source::File, file_partial.tpm.clone().map(Some)),
+                (Source::Env, env.tpm.clone().map(Some)),
+                (Source::Cli, cli.tpm.clone().map(Some)),
+            ],
+            &mut prov,
+        );
         let tls = resolve(
             "server.tls",
             None,
@@ -1216,6 +1621,7 @@ impl Config {
                     verifier,
                     verifier_endpoint,
                     verifier_api_key,
+                    tpm,
                 },
                 rate_limit: RateLimitConfig {
                     max_requests: rate_limit_max_requests,
@@ -1247,13 +1653,292 @@ mod tests {
         (PartialStatic::default(), Vec::new())
     }
 
+    fn tpm_policy() -> TpmConfig {
+        let mut expected = BTreeMap::new();
+        expected.insert(0u32, vec![0u8; 32]);
+        TpmConfig {
+            expected_pcrs: expected,
+            pinned_ak_sec1: None,
+            pcr_selection: None,
+            trusted_ek_root_paths: Vec::new(),
+            allow_unpinned_ak: true,
+        }
+    }
+
+    #[test]
+    fn tpm_verifier_without_policy_fails_validation() {
+        let file = (
+            PartialStatic {
+                verifier: Some(VerifierKind::Tpm),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let cfg = Config::resolve_layers(file, PartialStatic::default(), PartialStatic::default());
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
+        assert!(err.to_string().contains("attestation.tpm"));
+    }
+
+    #[test]
+    fn tpm_provider_without_policy_fails_validation() {
+        let file = (
+            PartialStatic {
+                tee_provider: Some(TeeProviderKind::Tpm),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let cfg = Config::resolve_layers(file, PartialStatic::default(), PartialStatic::default());
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn tpm_verifier_with_policy_validates() {
+        let file = (
+            PartialStatic {
+                verifier: Some(VerifierKind::Tpm),
+                tpm: Some(tpm_policy()),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let cfg = Config::resolve_layers(file, PartialStatic::default(), PartialStatic::default());
+        assert!(cfg.validate().is_ok());
+        assert_eq!(cfg.r#static.attestation.tpm.as_ref().unwrap().expected_pcrs.len(), 1);
+    }
+
+    #[test]
+    fn tpm_empty_expected_pcrs_fails_validation() {
+        let file = (
+            PartialStatic {
+                verifier: Some(VerifierKind::Tpm),
+                tpm: Some(TpmConfig {
+                    expected_pcrs: BTreeMap::new(),
+                    pinned_ak_sec1: None,
+                    pcr_selection: None,
+                    trusted_ek_root_paths: Vec::new(),
+                    allow_unpinned_ak: true,
+                }),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let cfg = Config::resolve_layers(file, PartialStatic::default(), PartialStatic::default());
+        assert!(matches!(cfg.validate(), Err(ConfigError::Validation(_))));
+    }
+
+    #[test]
+    fn tpm_file_hex_decodes_to_bytes() {
+        let ft = FileTpm {
+            expected_pcrs: {
+                let mut m = BTreeMap::new();
+                m.insert("0".to_owned(), "00".repeat(32));
+                m.insert("7".to_owned(), "ab".repeat(32));
+                m
+            },
+            pinned_ak_sec1_hex: Some(format!("04{}", "11".repeat(64))),
+            pcr_selection: Some(vec![0, 1, 7]),
+            trusted_ek_root_paths: vec!["/path/ek-root.pem".to_owned()],
+            allow_unpinned_ak: true,
+        };
+        let tc = ft.resolve().unwrap();
+        assert_eq!(tc.expected_pcrs[&0], vec![0u8; 32]);
+        assert_eq!(tc.expected_pcrs[&7], vec![0xabu8; 32]);
+        assert_eq!(tc.pinned_ak_sec1.as_ref().unwrap().len(), 65);
+        assert_eq!(tc.pcr_selection, Some(vec![0, 1, 7]));
+        assert_eq!(tc.trusted_ek_root_paths, vec!["/path/ek-root.pem".to_owned()]);
+        assert!(tc.allow_unpinned_ak);
+    }
+
+    #[test]
+    fn tpm_file_bad_hex_is_config_error() {
+        let ft = FileTpm {
+            expected_pcrs: {
+                let mut m = BTreeMap::new();
+                m.insert("0".to_owned(), "zznothex".to_owned());
+                m
+            },
+            pinned_ak_sec1_hex: None,
+            pcr_selection: None,
+            trusted_ek_root_paths: Vec::new(),
+            allow_unpinned_ak: false,
+        };
+        let err = ft.resolve().unwrap_err();
+        assert!(matches!(err, ConfigError::Env { .. }));
+        assert!(err.to_string().contains("attestation.tpm.expected_pcrs[0]"));
+    }
+
+    #[test]
+    fn tpm_verifier_with_pcrs_but_no_trust_mode_fails_validation() {
+        // Non-empty PCRs but none of pin / roots / allow_unpinned -> reject at
+        // startup rather than per-request.
+        let mut expected = BTreeMap::new();
+        expected.insert(0u32, vec![0u8; 32]);
+        let file = (
+            PartialStatic {
+                verifier: Some(VerifierKind::Tpm),
+                tpm: Some(TpmConfig {
+                    expected_pcrs: expected,
+                    pinned_ak_sec1: None,
+                    pcr_selection: None,
+                    trusted_ek_root_paths: Vec::new(),
+                    allow_unpinned_ak: false,
+                }),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let cfg = Config::resolve_layers(file, PartialStatic::default(), PartialStatic::default());
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::Validation(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("pinned_ak_sec1_hex"), "got {msg}");
+        assert!(msg.contains("trusted_ek_root_paths"), "got {msg}");
+        assert!(msg.contains("allow_unpinned_ak"), "got {msg}");
+    }
+
+    #[test]
+    fn tpm_verifier_with_allow_unpinned_ak_validates() {
+        let mut expected = BTreeMap::new();
+        expected.insert(0u32, vec![0u8; 32]);
+        let file = (
+            PartialStatic {
+                verifier: Some(VerifierKind::Tpm),
+                tpm: Some(TpmConfig {
+                    expected_pcrs: expected,
+                    pinned_ak_sec1: None,
+                    pcr_selection: None,
+                    trusted_ek_root_paths: Vec::new(),
+                    allow_unpinned_ak: true,
+                }),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let cfg = Config::resolve_layers(file, PartialStatic::default(), PartialStatic::default());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn tpm_verifier_with_pinned_ak_validates() {
+        let mut expected = BTreeMap::new();
+        expected.insert(0u32, vec![0u8; 32]);
+        let file = (
+            PartialStatic {
+                verifier: Some(VerifierKind::Tpm),
+                tpm: Some(TpmConfig {
+                    expected_pcrs: expected,
+                    pinned_ak_sec1: Some(vec![4u8; 65]),
+                    pcr_selection: None,
+                    trusted_ek_root_paths: Vec::new(),
+                    allow_unpinned_ak: false,
+                }),
+                ..Default::default()
+            },
+            Vec::new(),
+        );
+        let cfg = Config::resolve_layers(file, PartialStatic::default(), PartialStatic::default());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn tpm_file_round_trips_trust_fields() {
+        let toml = r#"
+[attestation]
+verifier = "tpm"
+tee_provider = "tpm"
+
+[attestation.tpm]
+trusted_ek_root_paths = ["/a/root.pem", "/b/root.der"]
+allow_unpinned_ak = true
+
+[attestation.tpm.expected_pcrs]
+0 = "0000000000000000000000000000000000000000000000000000000000000000"
+"#;
+        let dir = std::env::temp_dir().join(format!("aproxy-tpm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.toml");
+        std::fs::write(&path, toml).unwrap();
+        let (partial, _routes) = Config::read_file(path.to_str().unwrap()).unwrap();
+        let tpm = partial.tpm.unwrap();
+        assert_eq!(
+            tpm.trusted_ek_root_paths,
+            vec!["/a/root.pem".to_owned(), "/b/root.der".to_owned()]
+        );
+        assert!(tpm.allow_unpinned_ak);
+        assert_eq!(tpm.expected_pcrs.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tpm_env_round_trips_trust_fields() {
+        // read_tpm_env reads process env; use unique guards so the test is
+        // hermetic and does not collide with the other env-reading tests.
+        let pcr = "ARCHETYPE_PROXY_TPM_EXPECTED_PCRS";
+        let roots = "ARCHETYPE_PROXY_TPM_TRUSTED_EK_ROOT_PATHS";
+        let allow = "ARCHETYPE_PROXY_TPM_ALLOW_UNPINNED_AK";
+        unsafe {
+            std::env::set_var(pcr, "0:0000000000000000000000000000000000000000000000000000000000000000");
+            std::env::set_var(roots, "/x/root.pem:/y/root.der,/z/root.pem");
+            std::env::set_var(allow, "true");
+        }
+        let tpm = Config::read_tpm_env().unwrap().unwrap();
+        assert_eq!(
+            tpm.trusted_ek_root_paths,
+            vec![
+                "/x/root.pem".to_owned(),
+                "/y/root.der".to_owned(),
+                "/z/root.pem".to_owned()
+            ]
+        );
+        assert!(tpm.allow_unpinned_ak);
+        assert_eq!(tpm.expected_pcrs.len(), 1);
+        unsafe {
+            std::env::remove_var(pcr);
+            std::env::remove_var(roots);
+            std::env::remove_var(allow);
+        }
+    }
+
+    #[test]
+    fn tpm_load_cert_der_parses_pem_and_der() {
+        // Generate a self-signed cert; write it once as PEM and once as DER and
+        // confirm both load to the same DER bytes.
+        let cert = rcgen::generate_simple_self_signed(vec!["ek-root.example".to_owned()]).unwrap();
+        let der = cert.cert.der().to_vec();
+        let pem = cert.cert.pem();
+
+        let dir = std::env::temp_dir().join(format!("aproxy-cert-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pem_path = dir.join("root.pem");
+        let der_path = dir.join("root.der");
+        std::fs::write(&pem_path, pem.as_bytes()).unwrap();
+        std::fs::write(&der_path, &der).unwrap();
+
+        let from_pem = load_cert_der(pem_path.to_str().unwrap()).unwrap();
+        let from_der = load_cert_der(der_path.to_str().unwrap()).unwrap();
+        assert_eq!(from_pem.len(), 1);
+        assert_eq!(from_der.len(), 1);
+        assert_eq!(from_pem[0], der);
+        assert_eq!(from_der[0], der);
+
+        // A garbage file is a clear config error naming the path.
+        let bad_path = dir.join("bad.der");
+        std::fs::write(&bad_path, b"not a certificate").unwrap();
+        let err = load_cert_der(bad_path.to_str().unwrap()).unwrap_err();
+        assert!(err.to_string().contains("bad.der"), "got {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn defaults_when_all_layers_silent() {
         let cfg = Config::resolve_layers(empty_file(), PartialStatic::default(), PartialStatic::default());
         assert_eq!(cfg.r#static.server.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
         assert!(cfg.r#static.attestation.allow_mock);
         assert!(!cfg.r#static.discovery.docker.enabled);
-        // BLOCKER B + rate-limit defaults.
+        // Eviction and rate-limit defaults.
         assert_eq!(
             cfg.r#static.attestation.atb_eviction_interval_secs,
             DEFAULT_ATB_EVICTION_INTERVAL_SECS
@@ -1442,7 +2127,7 @@ mod tests {
 
     #[test]
     fn discovered_overrides_file_on_identical_rule() {
-        // BLOCKER 1: same (host, path_prefix); discovered must win.
+        // Same (host, path_prefix); discovered must win.
         let file_first = RouteTable::new(vec![
             route_src("file", "/v1", "http://file:80", Source::File),
             route_src("disc", "/v1", "http://disc:80", Source::Discovered),
@@ -1464,7 +2149,7 @@ mod tests {
 
     #[test]
     fn more_specific_file_route_still_beats_less_specific_discovered() {
-        // Specificity wins across DIFFERENT rules regardless of source.
+        // Specificity wins across different rules regardless of source.
         let t = RouteTable::new(vec![
             route_src("disc-short", "/api", "http://disc:80", Source::Discovered),
             route_src("file-long", "/api/v2", "http://file:80", Source::File),
@@ -1474,7 +2159,7 @@ mod tests {
 
     #[test]
     fn path_prefix_matches_on_segment_boundary() {
-        // BLOCKER 2: "/v1" must not match "/v123".
+        // "/v1" must not match "/v123".
         assert!(path_prefix_matches("/v1", "/v1"));
         assert!(path_prefix_matches("/v1", "/v1/ok"));
         assert!(path_prefix_matches("/v1/", "/v1/ok"));
@@ -1500,7 +2185,7 @@ mod tests {
 
     #[test]
     fn namespace_cleared_by_higher_layer() {
-        // SHOULD-FIX 4: file sets namespace, env clears it (empty => all).
+        // File sets namespace, env clears it (empty => all).
         let file = (
             PartialStatic {
                 kubernetes_namespace: namespace_layer(Some("prod".to_owned())),
@@ -1706,5 +2391,66 @@ upstream = "http://default:80"
             acme: Some(acme_cfg(AcmeChallenge::Dns01, &["*.example.com"])),
         };
         assert!(matches!(tls.validate(), Ok(TlsMode::Acme(_))));
+    }
+
+    #[test]
+    fn dns_provider_kind_parses_cloudflare() {
+        assert_eq!(
+            "cloudflare".parse::<DnsProviderKind>().unwrap(),
+            DnsProviderKind::Cloudflare
+        );
+        assert_eq!(
+            "cf".parse::<DnsProviderKind>().unwrap(),
+            DnsProviderKind::Cloudflare
+        );
+        assert_eq!(
+            "manual".parse::<DnsProviderKind>().unwrap(),
+            DnsProviderKind::Manual
+        );
+        let err = "route53".parse::<DnsProviderKind>().unwrap_err();
+        assert!(err.contains("expected manual|cloudflare"), "got {err}");
+    }
+
+    #[test]
+    fn acme_dns_config_round_trips_cloudflare_fields() {
+        let toml = r#"
+provider = "cloudflare"
+api_token = "inline-tok"
+api_token_env = "CF_API_TOKEN"
+zone_id = "zone-abc"
+propagation_secs = 30
+"#;
+        let cfg: AcmeDnsConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.provider, DnsProviderKind::Cloudflare);
+        assert_eq!(cfg.api_token.as_deref(), Some("inline-tok"));
+        assert_eq!(cfg.api_token_env.as_deref(), Some("CF_API_TOKEN"));
+        assert_eq!(cfg.zone_id.as_deref(), Some("zone-abc"));
+        assert_eq!(cfg.propagation_secs, 30);
+    }
+
+    #[test]
+    fn cf_token_resolves_inline_then_env() {
+        // Inline token wins.
+        let cfg = AcmeDnsConfig {
+            api_token: Some("inline".to_owned()),
+            api_token_env: Some("APROXY_TEST_CF_TOKEN_UNSET".to_owned()),
+            ..AcmeDnsConfig::default()
+        };
+        assert_eq!(cfg.resolve_cf_token().as_deref(), Some("inline"));
+
+        // Env var used when no inline token. Use a unique var name.
+        let var = "APROXY_TEST_CF_TOKEN_RESOLVE";
+        unsafe { std::env::set_var(var, "from-env") };
+        let cfg = AcmeDnsConfig {
+            api_token: None,
+            api_token_env: Some(var.to_owned()),
+            ..AcmeDnsConfig::default()
+        };
+        assert_eq!(cfg.resolve_cf_token().as_deref(), Some("from-env"));
+        unsafe { std::env::remove_var(var) };
+
+        // Neither set -> None.
+        let cfg = AcmeDnsConfig::default();
+        assert_eq!(cfg.resolve_cf_token(), None);
     }
 }

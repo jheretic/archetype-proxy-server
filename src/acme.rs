@@ -1,9 +1,9 @@
-// ACME automatic TLS certificate provisioning (task #12).
+// ACME automatic TLS certificate provisioning.
 //
-// Builds on the task #11 cert-source seam: the issued/renewed cert is fed into
-// an `AcmeResolver` (a swappable `ResolvesServerCert`, `tls.rs`) wrapped as
-// `CertSource::Dynamic`, so renewals take effect on the live :443 listener
-// WITHOUT a restart and WITHOUT touching the listener wiring.
+// The issued/renewed cert is fed into an `AcmeResolver` (a swappable
+// `ResolvesServerCert`, `tls.rs`) wrapped as `CertSource::Dynamic`, so
+// renewals take effect on the live :443 listener without a restart and without
+// touching the listener wiring.
 //
 // Three config-selectable challenge types (RFC 8555 / RFC 8737):
 //   * tls-alpn-01 (default): a validation cert is installed into the
@@ -12,10 +12,10 @@
 //   * http-01: a key-authorization is served at
 //     GET /.well-known/acme-challenge/<token> by a small plaintext :80 listener.
 //   * dns-01: a `_acme-challenge` TXT record is published via a `DnsProvider`
-//     (manual/hook). DNS-01 is the only type that can issue WILDCARD certs.
+//     (manual/hook). DNS-01 is the only type that can issue wildcard certs.
 //
-// FAIL-FAST: any ACME error aborts issuance with a clear log; the server NEVER
-// silently serves plaintext or an expired cert. Account + issued cert are
+// Any ACME error aborts issuance with a clear log; the server does not
+// silently serve plaintext or an expired cert. Account + issued cert are
 // persisted under `cache_dir` and a still-valid cached cert is reused on boot.
 
 use std::collections::HashMap;
@@ -33,7 +33,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::sign::CertifiedKey;
 use tokio::sync::Mutex;
 
-use crate::config::{AcmeChallenge, AcmeConfig};
+use crate::config::{AcmeChallenge, AcmeConfig, DnsProviderKind};
 use crate::tls::AcmeResolver;
 
 /// Renew when the certificate has this much (or less) of its lifetime left.
@@ -68,12 +68,14 @@ pub enum AcmeError {
     Order(OrderStatus),
     #[error("DNS-01 hook command failed: {0}")]
     DnsHook(String),
+    #[error("DNS-01 provider error: {0}")]
+    Dns(String),
     #[error("rustls key error: {0}")]
     Rustls(#[from] rustls::Error),
 }
 
 /// A pending challenge response the manager must publish before telling the CA
-/// to validate. Produced by [`challenge_response`] (pure; unit-tested).
+/// to validate. Produced by [`challenge_response`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChallengeResponse {
     /// Serve `key_authorization` at `/.well-known/acme-challenge/{token}`.
@@ -93,11 +95,10 @@ pub enum ChallengeResponse {
 }
 
 /// Compute the challenge response payload from a challenge type and the
-/// already-extracted key-authorization values. Pure (no I/O) and free of the
-/// `KeyAuthorization` type so the per-type dispatch is unit-testable without a
-/// live CA. `key_auth` is the raw authorization string (HTTP-01 body),
-/// `digest` its SHA-256 (TLS-ALPN-01), `dns_value` its base64url digest
-/// (DNS-01 TXT value).
+/// already-extracted key-authorization values. Takes no `KeyAuthorization` so
+/// the per-type dispatch can be tested without a live CA. `key_auth` is the
+/// raw authorization string (HTTP-01 body), `digest` its SHA-256
+/// (TLS-ALPN-01), `dns_value` its base64url digest (DNS-01 TXT value).
 #[must_use]
 pub fn build_challenge_response(
     challenge: AcmeChallenge,
@@ -124,7 +125,7 @@ pub fn build_challenge_response(
     }
 }
 
-/// Adapter from instant-acme's [`KeyAuthorization`] to the pure dispatch above.
+/// Adapter from instant-acme's [`KeyAuthorization`] to the dispatch above.
 #[must_use]
 pub fn challenge_response(
     challenge: AcmeChallenge,
@@ -186,7 +187,7 @@ impl Http01Tokens {
 
 /// A pluggable DNS-01 provider: publishes / removes the `_acme-challenge` TXT
 /// record. Only the manual/hook provider is implemented; specific APIs
-/// (Cloudflare/Route53/etc.) are pluggable follow-ups behind this trait.
+/// (Cloudflare/Route53/etc.) can be added behind this trait.
 #[async_trait::async_trait]
 pub trait DnsProvider: Send + Sync {
     /// Publish a TXT record `record_name` => `value`. Implementations should
@@ -263,7 +264,7 @@ impl DnsProvider for ManualDnsProvider {
                 tracing::warn!(
                     %record_name,
                     %value,
-                    "DNS-01 MANUAL mode: create this TXT record now \
+                    "DNS-01 manual mode: create this TXT record now \
                      (no hook_command configured)"
                 );
             }
@@ -285,6 +286,229 @@ impl DnsProvider for ManualDnsProvider {
     }
 }
 
+/// Default Cloudflare API base. Overridable so tests can point at a local stub.
+const CLOUDFLARE_API_BASE: &str = "https://api.cloudflare.com";
+
+/// Cloudflare API v4 DNS-01 provider. Publishes/removes the `_acme-challenge`
+/// TXT record over the shared reqwest stack (no `cloudflare` crate, so nothing
+/// pulls `ring`). The zone id is either configured or auto-discovered by
+/// walking the record's domain labels; discovered ids are cached.
+pub struct CloudflareDnsProvider {
+    client: reqwest::Client,
+    token: String,
+    zone_id: Option<String>,
+    base_url: String,
+    propagation: Duration,
+    // (record_name, value) -> created DNS record id, for cleanup.
+    records: Mutex<HashMap<(String, String), String>>,
+    // Cache of discovered zone ids keyed by the registrable domain candidate.
+    zone_cache: Mutex<HashMap<String, String>>,
+}
+
+#[derive(serde::Deserialize)]
+struct CfError {
+    code: i64,
+    message: String,
+}
+
+#[derive(serde::Deserialize)]
+struct CfEnvelope<T> {
+    success: bool,
+    #[serde(default)]
+    errors: Vec<CfError>,
+    result: Option<T>,
+}
+
+#[derive(serde::Deserialize)]
+struct CfRecord {
+    id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct CfZone {
+    id: String,
+}
+
+fn cf_errors_to_string(errors: &[CfError]) -> String {
+    if errors.is_empty() {
+        return "no error detail".to_owned();
+    }
+    errors
+        .iter()
+        .map(|e| format!("{} ({})", e.message, e.code))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+impl CloudflareDnsProvider {
+    #[must_use]
+    pub fn new(
+        client: reqwest::Client,
+        token: String,
+        zone_id: Option<String>,
+        propagation_secs: u64,
+    ) -> Self {
+        Self::with_base_url(
+            client,
+            token,
+            zone_id,
+            propagation_secs,
+            CLOUDFLARE_API_BASE.to_owned(),
+        )
+    }
+
+    #[must_use]
+    pub fn with_base_url(
+        client: reqwest::Client,
+        token: String,
+        zone_id: Option<String>,
+        propagation_secs: u64,
+        base_url: String,
+    ) -> Self {
+        Self {
+            client,
+            token,
+            zone_id,
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            propagation: Duration::from_secs(propagation_secs),
+            records: Mutex::new(HashMap::new()),
+            zone_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Registrable-domain candidates for zone lookup, from most specific up,
+    /// derived from the TXT record name with the leading `_acme-challenge.`
+    /// stripped. `_acme-challenge.foo.example.com` yields
+    /// `foo.example.com`, `example.com`, `com`.
+    fn zone_candidates(record_name: &str) -> Vec<String> {
+        let base = record_name
+            .strip_prefix("_acme-challenge.")
+            .unwrap_or(record_name);
+        let labels: Vec<&str> = base.split('.').filter(|l| !l.is_empty()).collect();
+        (0..labels.len())
+            .map(|i| labels[i..].join("."))
+            .collect()
+    }
+
+    async fn resolve_zone_id(&self, record_name: &str) -> Result<String, AcmeError> {
+        if let Some(id) = &self.zone_id {
+            return Ok(id.clone());
+        }
+        for candidate in Self::zone_candidates(record_name) {
+            if let Some(id) = self.zone_cache.lock().await.get(&candidate) {
+                return Ok(id.clone());
+            }
+            let url = format!("{}/client/v4/zones", self.base_url);
+            let resp = self
+                .client
+                .get(&url)
+                .bearer_auth(&self.token)
+                .query(&[("name", candidate.as_str())])
+                .send()
+                .await
+                .map_err(|e| AcmeError::Dns(format!("zone lookup request failed: {e}")))?;
+            let env: CfEnvelope<Vec<CfZone>> = resp
+                .json()
+                .await
+                .map_err(|e| AcmeError::Dns(format!("zone lookup decode failed: {e}")))?;
+            if !env.success {
+                return Err(AcmeError::Dns(format!(
+                    "zone lookup for {candidate:?} failed: {}",
+                    cf_errors_to_string(&env.errors)
+                )));
+            }
+            if let Some(zone) = env.result.and_then(|z| z.into_iter().next()) {
+                self.zone_cache
+                    .lock()
+                    .await
+                    .insert(candidate, zone.id.clone());
+                return Ok(zone.id);
+            }
+        }
+        Err(AcmeError::Dns(format!(
+            "no Cloudflare zone found for {record_name:?} (check the token has Zone:Read \
+             or set zone_id explicitly)"
+        )))
+    }
+}
+
+#[async_trait::async_trait]
+impl DnsProvider for CloudflareDnsProvider {
+    async fn publish(
+        &self,
+        _domain: &str,
+        record_name: &str,
+        value: &str,
+    ) -> Result<(), AcmeError> {
+        let zone_id = self.resolve_zone_id(record_name).await?;
+        let url = format!("{}/client/v4/zones/{zone_id}/dns_records", self.base_url);
+        let body = serde_json::json!({
+            "type": "TXT",
+            "name": record_name,
+            "content": value,
+            "ttl": 60,
+        });
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| AcmeError::Dns(format!("create TXT request failed: {e}")))?;
+        let env: CfEnvelope<CfRecord> = resp
+            .json()
+            .await
+            .map_err(|e| AcmeError::Dns(format!("create TXT decode failed: {e}")))?;
+        if !env.success {
+            return Err(AcmeError::Dns(format!(
+                "create TXT {record_name:?} failed: {}",
+                cf_errors_to_string(&env.errors)
+            )));
+        }
+        let record = env
+            .result
+            .ok_or_else(|| AcmeError::Dns("create TXT returned no record".to_owned()))?;
+        self.records
+            .lock()
+            .await
+            .insert((record_name.to_owned(), value.to_owned()), record.id);
+
+        tracing::info!(
+            secs = self.propagation.as_secs(),
+            "waiting for DNS propagation"
+        );
+        tokio::time::sleep(self.propagation).await;
+        Ok(())
+    }
+
+    async fn cleanup(&self, _domain: &str, record_name: &str, value: &str) {
+        let key = (record_name.to_owned(), value.to_owned());
+        let Some(record_id) = self.records.lock().await.remove(&key) else {
+            tracing::warn!(%record_name, "no tracked Cloudflare record id to clean up");
+            return;
+        };
+        let zone_id = match self.resolve_zone_id(record_name).await {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(error = %e, "DNS-01 cleanup: zone resolve failed");
+                return;
+            }
+        };
+        let url = format!(
+            "{}/client/v4/zones/{zone_id}/dns_records/{record_id}",
+            self.base_url
+        );
+        match self.client.delete(&url).bearer_auth(&self.token).send().await {
+            Ok(resp) if resp.status().is_success() => {}
+            Ok(resp) => {
+                tracing::warn!(status = %resp.status(), "DNS-01 cleanup DELETE returned error");
+            }
+            Err(e) => tracing::warn!(error = %e, "DNS-01 cleanup DELETE failed"),
+        }
+    }
+}
+
 /// An issued certificate: PEM chain + PEM private key.
 #[derive(Debug, Clone)]
 pub struct IssuedCert {
@@ -294,7 +518,7 @@ pub struct IssuedCert {
 
 impl IssuedCert {
     /// Parse into a rustls `CertifiedKey` (aws-lc-rs provider). Verifies the
-    /// key matches the cert (fail-fast, same guarantee as static certs).
+    /// key matches the cert, the same check as for static certs.
     pub fn into_certified_key(&self) -> Result<CertifiedKey, AcmeError> {
         let certs = CertificateDer::pem_slice_iter(self.cert_pem.as_bytes())
             .collect::<Result<Vec<_>, _>>()
@@ -378,7 +602,7 @@ impl Cache {
 }
 
 /// Resolve the ACME directory URL from config (explicit URL > staging flag >
-/// Let's Encrypt production). Pure; unit-tested.
+/// Let's Encrypt production).
 #[must_use]
 pub fn directory_url(cfg: &AcmeConfig) -> String {
     if let Some(url) = &cfg.directory_url {
@@ -403,22 +627,45 @@ pub struct AcmeManager {
 }
 
 impl AcmeManager {
-    #[must_use]
-    pub fn new(cfg: AcmeConfig, resolver: Arc<AcmeResolver>, http_tokens: Http01Tokens) -> Self {
-        let dns: Arc<dyn DnsProvider> = Arc::new(ManualDnsProvider::new(
-            cfg.dns.hook_command.clone(),
-            cfg.dns.cleanup_command.clone(),
-            cfg.dns.propagation_secs,
-        ));
+    /// Fails fast if the Cloudflare provider is selected but no API token
+    /// resolves; token resolution at construction avoids surfacing a
+    /// misconfiguration only mid-issuance.
+    pub fn new(
+        cfg: AcmeConfig,
+        resolver: Arc<AcmeResolver>,
+        http_tokens: Http01Tokens,
+    ) -> Result<Self, AcmeError> {
+        let dns: Arc<dyn DnsProvider> = match cfg.dns.provider {
+            DnsProviderKind::Manual => Arc::new(ManualDnsProvider::new(
+                cfg.dns.hook_command.clone(),
+                cfg.dns.cleanup_command.clone(),
+                cfg.dns.propagation_secs,
+            )),
+            DnsProviderKind::Cloudflare => {
+                let token = cfg.dns.resolve_cf_token().ok_or_else(|| {
+                    AcmeError::Dns(
+                        "dns provider=cloudflare requires a token via api_token or \
+                         api_token_env (env var unset or empty)"
+                            .to_owned(),
+                    )
+                })?;
+                Arc::new(CloudflareDnsProvider::new(
+                    reqwest::Client::new(),
+                    token,
+                    cfg.dns.zone_id.clone(),
+                    cfg.dns.propagation_secs,
+                ))
+            }
+        };
         let cache = cfg.cache_dir.as_deref().map(Cache::new);
-        Self {
+        Ok(Self {
             cfg,
             resolver,
             http_tokens,
             dns,
             cache,
             lock: Mutex::new(()),
-        }
+        })
     }
 
     /// Load a cached, still-valid cert into the resolver. Returns true if a
@@ -495,7 +742,7 @@ impl AcmeManager {
     }
 
     /// Run a full ACME order for all configured domains, install the issued
-    /// cert into the resolver, and persist it. FAIL-FAST on any error.
+    /// cert into the resolver, and persist it. Aborts on any error.
     pub async fn issue(&self) -> Result<IssuedCert, AcmeError> {
         let _guard = self.lock.lock().await;
         let account = self.account().await?;
@@ -645,7 +892,7 @@ impl AcmeManager {
 
 /// Build a self-signed TLS-ALPN-01 validation cert for `domain` carrying the
 /// ACME identifier extension over `digest` (the SHA-256 of the key
-/// authorization), per RFC 8737. Signed with the aws-lc-rs rcgen backend.
+/// authorization), per RFC 8737.
 fn tls_alpn_cert(domain: &str, digest: &[u8]) -> Result<CertifiedKey, AcmeError> {
     let key_pair = rcgen::KeyPair::generate()?;
     let mut params = rcgen::CertificateParams::new(vec![domain.to_owned()])?;
@@ -775,7 +1022,6 @@ mod tests {
 
     #[test]
     fn tls_alpn_validation_cert_builds() {
-        // The validation cert must build into a usable CertifiedKey.
         let digest = [0x11u8; 32];
         let ck = tls_alpn_cert("example.com", &digest).unwrap();
         assert_eq!(ck.cert.len(), 1);
@@ -789,12 +1035,12 @@ mod tests {
 
     #[tokio::test]
     async fn manual_dns_provider_logs_without_hook() {
-        // No hook command => publish just waits (we use 0s propagation).
+        // No hook command => publish just waits (0s propagation here).
         let p = ManualDnsProvider::new(None, None, 0);
         p.publish("example.com", "_acme-challenge.example.com", "val")
             .await
             .unwrap();
-        // cleanup with no command is a no-op (must not panic).
+        // cleanup with no command is a no-op.
         p.cleanup("example.com", "_acme-challenge.example.com", "val")
             .await;
     }
@@ -825,5 +1071,249 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AcmeError::DnsHook(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn cf_zone_candidates_walk_labels() {
+        assert_eq!(
+            CloudflareDnsProvider::zone_candidates("_acme-challenge.foo.bar.example.com"),
+            vec!["foo.bar.example.com", "bar.example.com", "example.com", "com"]
+        );
+        // Wildcard TXT records share the base name; no _acme-challenge prefix
+        // is still handled.
+        assert_eq!(
+            CloudflareDnsProvider::zone_candidates("example.com"),
+            vec!["example.com", "com"]
+        );
+    }
+
+    // --- Cloudflare provider unit tests against a local axum stub ---
+    //
+    // These exercise the request/response wiring (JSON shape, Bearer auth,
+    // zone auto-discovery, record-id capture + DELETE, error mapping) without
+    // touching Cloudflare. Live DNS-01 issuance against a real token/zone plus
+    // public DNS propagation cannot run in CI and is exercised manually.
+
+    use std::sync::Arc as StdArc;
+    use std::sync::Mutex as StdMutex;
+
+    // reqwest uses rustls' `*-no-provider` feature, so a default crypto
+    // provider must be installed before building a client (main() does this at
+    // startup). Idempotent across tests.
+    fn install_crypto_provider() {
+        use std::sync::Once;
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let _ = aws_lc_rs::default_provider().install_default();
+        });
+    }
+
+    // (label, name-or-path, body, auth-header) captured per stub request.
+    type StubReq = (String, String, Option<String>, Option<String>);
+
+    #[derive(Default)]
+    struct StubState {
+        requests: StdMutex<Vec<StubReq>>,
+    }
+
+    async fn spawn_cf_stub(
+        state: StdArc<StubState>,
+        zone_name_match: Option<String>,
+        create_success: bool,
+    ) -> String {
+        use axum::extract::{Query, State};
+        use axum::routing::{delete, get, post};
+        use axum::{Json, Router};
+        use std::collections::HashMap as Map;
+
+        async fn list_zones(
+            State((state, zn)): State<(StdArc<StubState>, Option<String>)>,
+            Query(q): Query<Map<String, String>>,
+            headers: axum::http::HeaderMap,
+        ) -> Json<serde_json::Value> {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let name = q.get("name").cloned();
+            state.requests.lock().unwrap().push((
+                "GET zones".to_owned(),
+                q.get("name").cloned().unwrap_or_default(),
+                None,
+                auth,
+            ));
+            let matches = zn.as_deref() == name.as_deref();
+            let result = if matches {
+                serde_json::json!([{"id": "zone-123"}])
+            } else {
+                serde_json::json!([])
+            };
+            Json(serde_json::json!({"success": true, "errors": [], "result": result}))
+        }
+
+        async fn create_record(
+            State((state, ok)): State<(StdArc<StubState>, bool)>,
+            headers: axum::http::HeaderMap,
+            body: String,
+        ) -> Json<serde_json::Value> {
+            let auth = headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            state.requests.lock().unwrap().push((
+                "POST record".to_owned(),
+                String::new(),
+                Some(body),
+                auth,
+            ));
+            if ok {
+                Json(serde_json::json!({
+                    "success": true, "errors": [], "result": {"id": "rec-999"}
+                }))
+            } else {
+                Json(serde_json::json!({
+                    "success": false,
+                    "errors": [{"code": 1004, "message": "DNS record invalid"}],
+                    "result": null
+                }))
+            }
+        }
+
+        async fn delete_record(
+            State(state): State<StdArc<StubState>>,
+            axum::extract::Path((zone, id)): axum::extract::Path<(String, String)>,
+        ) -> Json<serde_json::Value> {
+            state.requests.lock().unwrap().push((
+                "DELETE record".to_owned(),
+                format!("{zone}/{id}"),
+                None,
+                None,
+            ));
+            Json(serde_json::json!({"success": true, "errors": [], "result": {"id": id}}))
+        }
+
+        let app = Router::new()
+            .route(
+                "/client/v4/zones",
+                get(list_zones).with_state((state.clone(), zone_name_match)),
+            )
+            .route(
+                "/client/v4/zones/{zone}/dns_records",
+                post(create_record).with_state((state.clone(), create_success)),
+            )
+            .route(
+                "/client/v4/zones/{zone}/dns_records/{id}",
+                delete(delete_record).with_state(state.clone()),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn cloudflare_publish_posts_txt_and_cleanup_deletes() {
+        install_crypto_provider();
+        let state = StdArc::new(StubState::default());
+        let base = spawn_cf_stub(state.clone(), Some("example.com".to_owned()), true).await;
+        let p = CloudflareDnsProvider::with_base_url(
+            reqwest::Client::new(),
+            "tok-abc".to_owned(),
+            None,
+            0,
+            base,
+        );
+
+        p.publish("example.com", "_acme-challenge.example.com", "txtval")
+            .await
+            .unwrap();
+        p.cleanup("example.com", "_acme-challenge.example.com", "txtval")
+            .await;
+
+        let reqs = state.requests.lock().unwrap();
+        // zone auto-discovery hit the list endpoint and matched example.com.
+        let zone_lookup = reqs.iter().find(|r| r.0 == "GET zones").unwrap();
+        assert_eq!(zone_lookup.1, "example.com");
+        assert_eq!(zone_lookup.3.as_deref(), Some("Bearer tok-abc"));
+
+        // create carried the right JSON + auth.
+        let create = reqs.iter().find(|r| r.0 == "POST record").unwrap();
+        assert_eq!(create.3.as_deref(), Some("Bearer tok-abc"));
+        let body: serde_json::Value = serde_json::from_str(create.2.as_deref().unwrap()).unwrap();
+        assert_eq!(body["type"], "TXT");
+        assert_eq!(body["name"], "_acme-challenge.example.com");
+        assert_eq!(body["content"], "txtval");
+
+        // cleanup deleted the captured record id in the discovered zone.
+        let del = reqs.iter().find(|r| r.0 == "DELETE record").unwrap();
+        assert_eq!(del.1, "zone-123/rec-999");
+    }
+
+    #[tokio::test]
+    async fn cloudflare_zone_discovery_walks_to_registrable_domain() {
+        install_crypto_provider();
+        let state = StdArc::new(StubState::default());
+        // Only the registrable domain matches; the more specific label must be
+        // tried and skipped first.
+        let base = spawn_cf_stub(state.clone(), Some("example.com".to_owned()), true).await;
+        let p = CloudflareDnsProvider::with_base_url(
+            reqwest::Client::new(),
+            "tok".to_owned(),
+            None,
+            0,
+            base,
+        );
+        p.publish("sub.example.com", "_acme-challenge.sub.example.com", "v")
+            .await
+            .unwrap();
+        let reqs = state.requests.lock().unwrap();
+        let names: Vec<&str> = reqs
+            .iter()
+            .filter(|r| r.0 == "GET zones")
+            .map(|r| r.1.as_str())
+            .collect();
+        assert_eq!(names.first(), Some(&"sub.example.com"));
+        assert!(names.contains(&"example.com"));
+    }
+
+    #[tokio::test]
+    async fn cloudflare_publish_maps_cf_failure_to_error() {
+        install_crypto_provider();
+        let state = StdArc::new(StubState::default());
+        let base = spawn_cf_stub(state, Some("example.com".to_owned()), false).await;
+        let p = CloudflareDnsProvider::with_base_url(
+            reqwest::Client::new(),
+            "tok".to_owned(),
+            Some("zone-123".to_owned()),
+            0,
+            base,
+        );
+        let err = p
+            .publish("example.com", "_acme-challenge.example.com", "v")
+            .await
+            .unwrap_err();
+        match err {
+            AcmeError::Dns(m) => assert!(m.contains("DNS record invalid"), "got {m}"),
+            other => panic!("expected AcmeError::Dns, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn construction_fails_fast_when_cloudflare_without_token() {
+        let mut cfg = base_cfg();
+        cfg.challenge = AcmeChallenge::Dns01;
+        cfg.dns = AcmeDnsConfig {
+            provider: DnsProviderKind::Cloudflare,
+            ..AcmeDnsConfig::default()
+        };
+        let resolver = Arc::new(AcmeResolver::empty());
+        match AcmeManager::new(cfg, resolver, Http01Tokens::new()) {
+            Ok(_) => panic!("expected construction to fail without a token"),
+            Err(AcmeError::Dns(_)) => {}
+            Err(other) => panic!("expected AcmeError::Dns, got {other:?}"),
+        }
     }
 }

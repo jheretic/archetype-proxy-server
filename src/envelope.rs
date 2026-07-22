@@ -1,35 +1,20 @@
-// SHARED DTO -- keep BYTE-IDENTICAL with
-// archetype-proxy-client/src-tauri/src/envelope.rs.
-//
-// The proxy seals its response to the client as a SEQUENCE of OpenHTTPA
-// `seal_stream` frames rather than one monolithic AEAD blob, so large bodies
-// never buffer fully in memory on either side. Each frame's plaintext is a
-// serde-JSON `StreamFrame`:
-//
-//   * The FIRST frame is `StreamFrame::Head { status, headers }`. The OpenHTTPA
-//     transport drops the real HTTP status (the client's trusted-request path
-//     errors on non-2xx and discards status/headers), so the TRUE upstream (or
-//     proxy-generated) status + headers MUST travel sealed INSIDE the stream.
-//     The server always sends transport-level 200; the real status lives here.
-//   * Every SUBSEQUENT frame is `StreamFrame::Body { data }` carrying one chunk
-//     of the response body, streamed as it arrives from the upstream.
-//
-// Wire framing of each `seal_stream` frame (set by OpenHTTPA, not us):
-//   [ len: u32 BE ][ counter: u64 BE ][ AES-256-GCM ciphertext ]
-// with AAD = "openhttpa:"+base_id || cumulative_SHA384(prev ciphertexts).
-//
-// Promotion to a shared `archetype-proxy-common` crate is a future option.
+// This is a wire type. Its serde schema is duplicated in
+// archetype-proxy-client/src-tauri/src/envelope.rs; change both copies together
+// or client and server will fail to decode each other's frames.
 use serde::{Deserialize, Serialize};
 
-/// One sealed frame in the response stream (see module docs).
+/// One frame of a sealed response stream.
+///
+/// The response travels as a sequence of `seal_stream` frames: a single `Head`
+/// carrying the status and headers, followed by `Body` frames for the payload.
+/// Status and headers ride inside the stream because the OpenHTTPA client
+/// discards the transport-level response line.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StreamFrame {
-    /// First frame: the real upstream / proxy-generated status + headers.
     Head {
         status: u16,
         headers: Vec<(String, String)>,
     },
-    /// Subsequent frames: one chunk of the response body (hex on the wire).
     Body {
         #[serde(with = "serde_bytes_hex")]
         data: Vec<u8>,

@@ -1,12 +1,11 @@
 // Kubernetes discovery — annotation-based, via `archetype.li/*` annotations on
 // Services/Ingresses.
 //
-// The pure annotation -> Route mapping (`route_from_annotations`) is always
-// compiled and unit-tested. The live kube-rs watcher is gated behind the
-// `kubernetes` cargo feature (task #15): the DEFAULT build does NOT pull the
-// heavy `kube` + `k8s-openapi` dependency tree and keeps the warn-and-yield
-// stub, so `[discovery] kubernetes = true` still doesn't crash a lean build.
-// Build the watcher with `cargo build --features kubernetes`.
+// The annotation -> Route mapping (`route_from_annotations`) is always
+// compiled. The live kube-rs watcher is gated behind the `kubernetes` cargo
+// feature so the default build omits the `kube` + `k8s-openapi` dependencies
+// and keeps a warn-and-yield stub; `[discovery] kubernetes = true` then serves
+// file/env routes only. Build the watcher with `cargo build --features kubernetes`.
 //
 // Annotation schema (per Service/Ingress):
 //   archetype.li/enable = "true"            (required to opt in)
@@ -70,7 +69,7 @@ impl KubernetesProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Stub provider — compiled when the `kubernetes` feature is OFF (default).
+// Stub provider, compiled when the `kubernetes` feature is disabled (default).
 // Keeps `[discovery] kubernetes = true` non-fatal on a lean build.
 // ---------------------------------------------------------------------------
 #[cfg(not(feature = "kubernetes"))]
@@ -91,7 +90,7 @@ impl DiscoveryProvider for KubernetesProvider {
 }
 
 // ---------------------------------------------------------------------------
-// Live watcher — compiled when the `kubernetes` feature is ON.
+// Live watcher, compiled when the `kubernetes` feature is enabled.
 // ---------------------------------------------------------------------------
 #[cfg(feature = "kubernetes")]
 mod watch {
@@ -225,9 +224,9 @@ mod watch {
         }
 
         async fn run(self: Box<Self>, tx: mpsc::Sender<ProviderUpdate>) {
-            // RESILIENT: failure to build a client (no kubeconfig, no in-cluster
-            // SA, unreachable API) must NOT crash the proxy. Log and return; the
-            // proxy keeps serving file/env routes.
+            // A client that can't be built (no kubeconfig, no in-cluster
+            // ServiceAccount, unreachable API) leaves the proxy serving
+            // file/env routes rather than crashing.
             let client = match Client::try_default().await {
                 Ok(c) => c,
                 Err(e) => {
@@ -262,7 +261,7 @@ mod watch {
             let ing_stream = watcher::watcher(ingresses, watcher::Config::default())
                 .map(|res| res.map(|ev| (Kind::Ingress, to_op(ev))));
             // The watcher streams are `!Unpin`; pin the merged stream on the
-            // heap so we can poll it in the loop below.
+            // heap for polling in the loop below.
             let mut merged = Box::pin(futures_util::stream::select(svc_stream, ing_stream));
 
             let mut svc_store = KindStore::default();
@@ -305,7 +304,7 @@ mod watch {
                     .await
                     .is_err()
                 {
-                    return; // manager gone
+                    return; // route manager dropped the receiver
                 }
                 last_sent = Some(routes);
             }
@@ -426,7 +425,7 @@ mod watch {
             assert_eq!(collect(&store), vec!["k8s/old"]);
 
             // A relist begins: Init clears the buffer but committed is untouched
-            // until InitDone, so we never expose a partial snapshot.
+            // until InitDone, so partial snapshots are never exposed.
             assert!(!store.apply(to_op(Event::<Service>::Init)));
             assert_eq!(collect(&store), vec!["k8s/old"], "committed stable during relist");
             assert!(!store.apply(to_op(Event::InitApply(opted("prod", "new", "http://new:80")))));

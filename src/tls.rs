@@ -1,21 +1,20 @@
-// Public-facing transport TLS termination (task #11). This is the OUTER
-// listener TLS, distinct from the attested OpenHTTPA session (the inner,
-// end-to-end encrypted channel), which is unaffected.
+// Public-facing transport TLS termination: the outer listener TLS, distinct
+// from the attested OpenHTTPA session (the inner, end-to-end encrypted
+// channel), which is unaffected.
 //
-// CRYPTO BACKEND: rustls is driven with the aws-lc-rs provider, installed
-// EXPLICITLY here. The dependency tree enables both rustls crypto features
+// Crypto backend: rustls is driven with the aws-lc-rs provider, installed
+// explicitly here. The dependency tree enables both rustls crypto features
 // (`aws_lc_rs` from the openhttpa crates' crypto stack and `ring` pulled in
 // transitively by rustls-webpki for cert-path verification), so rustls has no
-// unambiguous process-default provider — `ServerConfig::builder()` would panic.
-// `builder_with_provider(aws_lc_rs)` removes that ambiguity.
+// unambiguous process-default provider and `ServerConfig::builder()` would
+// panic. `builder_with_provider(aws_lc_rs)` removes that ambiguity.
 //
-// CERT-SOURCE SEAM (for task #12 ACME): `CertSource` abstracts where the
-// server certificate comes from. Both variants resolve to a single
-// `Arc<dyn ResolvesServerCert>`, and the listener wiring only ever sees that
-// resolver — so an ACME-backed, auto-renewing resolver (whose `CertifiedKey`
-// is swapped at runtime) plugs in via `CertSource::Dynamic` WITHOUT touching
-// `server_config` or the listener wiring in main.rs. Only `StaticFiles` is
-// implemented now.
+// `CertSource` abstracts where the server certificate comes from. Both
+// variants resolve to a single `Arc<dyn ResolvesServerCert>`, and the listener
+// wiring only sees that resolver, so an ACME-backed, auto-renewing resolver
+// (whose `CertifiedKey` is swapped at runtime) plugs in via
+// `CertSource::Dynamic` without touching `server_config` or the listener
+// wiring in main.rs.
 
 use std::sync::Arc;
 
@@ -66,18 +65,18 @@ pub enum TlsError {
 
 /// Where the server's TLS certificate comes from. The listener only consumes
 /// the `ResolvesServerCert` this produces, so new variants (e.g. an ACME-backed
-/// resolver in task #12) require no change to `server_config` or main.rs.
+/// resolver) require no change to `server_config` or main.rs.
 pub enum CertSource {
     /// Static PEM cert chain + private key loaded from disk at startup.
     StaticFiles { cert_path: String, key_path: String },
-    /// SEAM (task #12 ACME): a runtime-swappable cert resolver. Not used yet.
+    /// A runtime-swappable cert resolver (used by ACME).
     #[allow(dead_code)]
     Dynamic(Arc<dyn ResolvesServerCert>),
 }
 
 impl CertSource {
     /// Resolve this source into the rustls cert resolver the listener uses.
-    /// FAIL-FAST: static files are read + parsed here; any missing/unreadable/
+    /// Static files are read and parsed here; any missing, unreadable, or
     /// invalid PEM is a hard error (no plaintext fallback).
     fn into_resolver(self) -> Result<Arc<dyn ResolvesServerCert>, TlsError> {
         match self {
@@ -94,8 +93,8 @@ impl CertSource {
 }
 
 /// A `ResolvesServerCert` that always returns one fixed certificate. Used for
-/// `CertSource::StaticFiles`. Task #12's ACME resolver replaces this with one
-/// that hot-swaps the inner `CertifiedKey` on renewal.
+/// `CertSource::StaticFiles`; the ACME resolver ([`AcmeResolver`]) instead
+/// hot-swaps the inner `CertifiedKey` on renewal.
 #[derive(Debug)]
 struct StaticCertResolver(Arc<CertifiedKey>);
 
@@ -175,13 +174,13 @@ fn load_certified_key(cert_path: &str, key_path: &str) -> Result<CertifiedKey, T
         source,
     })?;
 
-    // FAIL-FAST on a cert/key MISMATCH: `CertifiedKey::new` does NOT check that
-    // the private key corresponds to the certificate's public key, so a
-    // mismatched pair would build a ServerConfig and only fail at handshake
-    // time. `keys_match()` compares SubjectPublicKeyInfo bytes up front. An
-    // `InconsistentKeys::Unknown` (provider can't introspect the key) is NOT
-    // treated as an error — only a definite mismatch. ACME-issued certs flow
-    // through the same `CertifiedKey` path (see `acme.rs`).
+    // `CertifiedKey::new` does not check that the private key corresponds to
+    // the certificate's public key, so a mismatched pair would build a
+    // ServerConfig and only fail at handshake time. `keys_match()` compares
+    // SubjectPublicKeyInfo bytes up front. An `InconsistentKeys::Unknown`
+    // (provider can't introspect the key) is not an error — only a definite
+    // mismatch. ACME-issued certs flow through the same `CertifiedKey` path
+    // (see `acme.rs`).
     let certified = CertifiedKey::new(certs, signing_key);
     match certified.keys_match() {
         Ok(()) | Err(rustls::Error::InconsistentKeys(rustls::InconsistentKeys::Unknown)) => {}
@@ -196,13 +195,13 @@ fn load_certified_key(cert_path: &str, key_path: &str) -> Result<CertifiedKey, T
     Ok(certified)
 }
 
-/// A runtime-swappable cert resolver for ACME (task #12). Holds the live
-/// production certificate (hot-swapped on renewal via [`AcmeResolver::store`]
-/// so the listener picks up the new cert without a restart) AND, for the
-/// duration of a TLS-ALPN-01 challenge, a map of short-lived validation certs
-/// keyed by SNI. When a ClientHello negotiates the `acme-tls/1` ALPN protocol
-/// (the validation handshake), the matching validation cert is served instead
-/// of the production cert. This is the concrete type fed into
+/// A runtime-swappable cert resolver for ACME. Holds the live production
+/// certificate (hot-swapped on renewal via [`AcmeResolver::store`] so the
+/// listener picks up the new cert without a restart) and, for the duration of
+/// a TLS-ALPN-01 challenge, a map of short-lived validation certs keyed by
+/// SNI. When a ClientHello negotiates the `acme-tls/1` ALPN protocol (the
+/// validation handshake), the matching validation cert is served instead of
+/// the production cert. This is the concrete type fed into
 /// [`CertSource::Dynamic`].
 #[derive(Debug)]
 pub struct AcmeResolver {
@@ -215,8 +214,8 @@ pub struct AcmeResolver {
 
 impl AcmeResolver {
     /// Create an empty resolver (no cert yet). `resolve` returns `None` until
-    /// a cert is stored, which makes the TLS handshake fail rather than serve
-    /// a bogus cert — never a plaintext fallback.
+    /// a cert is stored, so the TLS handshake fails rather than serving a
+    /// bogus cert.
     #[must_use]
     pub fn empty() -> Self {
         Self {
@@ -253,7 +252,7 @@ impl AcmeResolver {
 
 impl ResolvesServerCert for AcmeResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
-        // A TLS-ALPN-01 validation connection negotiates ONLY `acme-tls/1`.
+        // A TLS-ALPN-01 validation connection negotiates only `acme-tls/1`.
         let is_acme_alpn = client_hello
             .alpn()
             .is_some_and(|mut p| p.any(|proto| proto == ACME_TLS_ALPN_NAME));
@@ -314,7 +313,7 @@ mod tests {
             key_path,
         })
         .unwrap_err();
-        // No certs parse out of garbage -> NoCerts.
+        // No certs parse out of the garbage input -> NoCerts.
         assert!(matches!(err, TlsError::NoCerts { .. }), "got {err:?}");
         let _ = std::fs::remove_dir_all(&dir);
     }

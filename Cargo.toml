@@ -5,15 +5,15 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
-openhttpa-proto       = { git = "https://github.com/OpenHTTPA/openhttpa-rs", rev = "ae6d3909c23cd240962c10e9439eb7ac207ca4c3" }
-openhttpa-crypto      = { git = "https://github.com/OpenHTTPA/openhttpa-rs", rev = "ae6d3909c23cd240962c10e9439eb7ac207ca4c3" }
-openhttpa-headers     = { git = "https://github.com/OpenHTTPA/openhttpa-rs", rev = "ae6d3909c23cd240962c10e9439eb7ac207ca4c3" }
-openhttpa-core        = { git = "https://github.com/OpenHTTPA/openhttpa-rs", rev = "ae6d3909c23cd240962c10e9439eb7ac207ca4c3" }
-openhttpa-tee         = { git = "https://github.com/OpenHTTPA/openhttpa-rs", rev = "ae6d3909c23cd240962c10e9439eb7ac207ca4c3" }
-openhttpa-attestation = { git = "https://github.com/OpenHTTPA/openhttpa-rs", rev = "ae6d3909c23cd240962c10e9439eb7ac207ca4c3" }
-openhttpa-transport   = { git = "https://github.com/OpenHTTPA/openhttpa-rs", rev = "ae6d3909c23cd240962c10e9439eb7ac207ca4c3" }
-openhttpa-server      = { git = "https://github.com/OpenHTTPA/openhttpa-rs", rev = "ae6d3909c23cd240962c10e9439eb7ac207ca4c3" }
-openhttpa-client      = { git = "https://github.com/OpenHTTPA/openhttpa-rs", rev = "ae6d3909c23cd240962c10e9439eb7ac207ca4c3" }
+openhttpa-proto       = { path = "../openhttpa-rs/crates/openhttpa-proto" }
+openhttpa-crypto      = { path = "../openhttpa-rs/crates/openhttpa-crypto" }
+openhttpa-headers     = { path = "../openhttpa-rs/crates/openhttpa-headers" }
+openhttpa-core        = { path = "../openhttpa-rs/crates/openhttpa-core" }
+openhttpa-tee         = { path = "../openhttpa-rs/crates/openhttpa-tee" }
+openhttpa-attestation = { path = "../openhttpa-rs/crates/openhttpa-attestation" }
+openhttpa-transport   = { path = "../openhttpa-rs/crates/openhttpa-transport" }
+openhttpa-server      = { path = "../openhttpa-rs/crates/openhttpa-server" }
+openhttpa-client      = { path = "../openhttpa-rs/crates/openhttpa-client" }
 
 tokio              = { version = "1", features = ["full"] }
 axum               = { version = "0.8", features = ["ws", "query"] }
@@ -92,6 +92,10 @@ aws_nitro = ["openhttpa-tee/aws_nitro"]
 maa       = ["openhttpa-attestation/maa"]
 ita       = ["openhttpa-attestation/ita"]
 amd_snp   = ["openhttpa-attestation/amd_snp"]
+# TPM 2.0 measured-boot: real quote provider (openhttpa-tee) + fail-closed
+# verifier (openhttpa-attestation). Pulls tss-esapi -> system tpm2-tss at build
+# time. Integration test needs swtpm (see tests/tpm_swtpm.rs).
+tpm       = ["openhttpa-attestation/tpm", "openhttpa-tee/tpm"]
 
 [lib]
 name = "archetype_proxy_server"

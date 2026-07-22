@@ -1,7 +1,6 @@
-// OpenHTTPA session termination + reverse-proxy. Per-request the upstream is
-// selected from the live (hot-reloadable) route table by host/path-prefix.
-// Decrypt incoming trusted request -> forward plaintext to upstream via reqwest
-// -> seal a {status, headers, body} envelope back to the client.
+// Terminates attested sessions and reverse-proxies decrypted traffic: decrypt
+// the trusted request, select an upstream from the live route table by
+// host/path, forward via reqwest, and stream a sealed response back.
 
 use std::sync::Arc;
 
@@ -22,18 +21,12 @@ use crate::config::RouteTable;
 use crate::envelope::StreamFrame;
 use crate::metrics::Metrics;
 
-/// Header carrying the browser's REAL HTTP method. The attested transport
-/// request always uses the wire method POST (so the encrypted envelope in the
-/// body survives transports that drop the body on GET/HEAD/DELETE), and the
-/// browser's actual method rides in this `attest-`-prefixed header. The
-/// `attest-` prefix is LOAD-BEARING: `update_ahl` folds every `attest-*` header
-/// (except ticket/binder) into the HMAC-SHA-384 AHL on both client and server,
-/// so by the time the Attest-Ticket MAC has verified here, this header value is
-/// already authenticated — a man-in-the-middle cannot rewrite the real method
-/// without invalidating the MAC. We therefore trust it for upstream forwarding.
-/// KEEP IN SYNC with the identical const in
-/// archetype-proxy-client/src-tauri/src/session.rs (no shared dependency —
-/// mirrors the envelope.rs / LogLevel duplication theme).
+/// Carries the client's real HTTP method. The wire request is always POST so
+/// the encrypted body survives transports that drop it on GET/HEAD/DELETE; the
+/// real method travels here. The `attest-` prefix is required: `update_ahl`
+/// folds every `attest-*` header into the AHL MAC, so a verified Attest-Ticket
+/// authenticates this value and it can be trusted for upstream forwarding.
+/// Kept in sync with the same const in the client's session.rs.
 const HDR_ATTEST_REAL_METHOD: &str = "attest-real-method";
 
 #[derive(Clone)]
@@ -59,8 +52,7 @@ impl FromRef<ProxyState> for Metrics {
     }
 }
 
-/// Newtype so the `DecryptedRequest` extractor can read the configured body
-/// cap from state (needed for the PRE-DECRYPT envelope cap, SHOULD-FIX 1).
+/// Lets the `DecryptedRequest` extractor read the body cap from state.
 #[derive(Clone, Copy)]
 pub struct MaxBodyBytes(pub usize);
 
@@ -70,10 +62,9 @@ impl FromRef<ProxyState> for MaxBodyBytes {
     }
 }
 
-/// Decrypted trusted request: plaintext body plus the request metadata needed
-/// to reconstruct the outbound call. Mirrors the proven `EncryptedJson`
-/// extractor decrypt+MAC path but yields raw bytes (so arbitrary, non-JSON
-/// bodies round-trip) and the method/path/query.
+/// A decrypted trusted request: plaintext body plus the metadata needed to
+/// reconstruct the outbound call. Follows the `EncryptedJson` decrypt+MAC path
+/// but yields raw bytes so arbitrary (non-JSON) bodies round-trip.
 pub struct DecryptedRequest {
     pub session: OpenHttpaSession,
     pub method: http::Method,
@@ -120,11 +111,9 @@ where
         })?;
         let (nonce_val, mac_val) = (decoded.nonce, decoded.mac);
 
-        // SHOULD-FIX 1: PRE-DECRYPT cap on the encrypted envelope. The body is
-        // `{"ciphertext":"<hex>"}`; hex doubles the ciphertext bytes and the
-        // ciphertext is at most plaintext + 16 (GCM tag). Reject anything
-        // larger BEFORE buffering / hex-decoding so a malicious client cannot
-        // force unbounded memory. Saturating arithmetic avoids overflow.
+        // Cap the encrypted envelope before buffering. The body is
+        // {"ciphertext":"<hex>"}: hex doubles the ciphertext, which is at most
+        // plaintext + 16 (GCM tag), plus a little JSON overhead.
         const JSON_OVERHEAD: usize = 64;
         let pre_decrypt_cap = max_body_bytes
             .saturating_add(16)
@@ -239,8 +228,6 @@ where
             },
         );
 
-        // Count MAC/decrypt verification failures (the crypto path itself is
-        // unchanged; we only observe its result at the edge).
         let plaintext = match plaintext_res {
             Ok(Ok(p)) => p,
             Ok(Err(resp)) => {
@@ -253,13 +240,8 @@ where
             }
         };
 
-        // SEMANTIC method: the wire `parts.method` is always POST (the client
-        // sends POST so the encrypted envelope body survives bodyless
-        // transports). The browser's REAL method rides in the AHL-bound
-        // `attest-real-method` header -- which has already been authenticated by
-        // the Attest-Ticket MAC above (update_ahl folds all `attest-*` headers
-        // into the MAC). Use it for upstream forwarding; fall back to the wire
-        // method when the header is absent (older clients / non-bridge callers).
+        // The wire method is always POST; the real method is in the (MAC-bound)
+        // attest-real-method header. Fall back to the wire method if absent.
         let method = parts
             .headers
             .get(HDR_ATTEST_REAL_METHOD)
@@ -278,16 +260,13 @@ where
     }
 }
 
-/// Build the proxy router: the OpenHTTPA base router (handshake/ATTEST route)
-/// plus unauthenticated `/healthz` (liveness), `/readyz` (readiness),
-/// `/metrics` (Prometheus), and an attested catch-all reverse proxy.
-///
-/// `/healthz`, `/readyz`, and `/metrics` do NOT require attestation.
+/// Build the router: the OpenHTTPA base router (handshake), the attested
+/// catch-all reverse proxy, and the unauthenticated `/healthz`, `/readyz`, and
+/// `/metrics` endpoints.
 pub fn build_router(base_router: Router, state: ProxyState) -> Router {
     let tr_layer = TrRequestLayer::new(state.registry.clone());
 
-    // Count successful handshakes on /attest. The base router owns the ATTEST
-    // handler; we only observe its responses (POST /attest, 2xx) at the edge.
+    // Count successful handshakes by observing /attest responses.
     let metrics_for_hs = state.metrics.clone();
     let base_router = base_router.layer(axum::middleware::from_fn(
         move |req: Request, next: axum::middleware::Next| {
@@ -303,8 +282,7 @@ pub fn build_router(base_router: Router, state: ProxyState) -> Router {
         },
     ));
 
-    // Observability endpoints share the proxy state (for the registry + metrics)
-    // but are NOT behind the attestation (TrRequestLayer) gate.
+    // Observability endpoints share state but sit outside the attestation gate.
     let observability = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -319,13 +297,9 @@ pub fn build_router(base_router: Router, state: ProxyState) -> Router {
 
     let merged = base_router.merge(observability).merge(proxy_routes);
 
-    // WS DISPATCH (task #14): an attested WebSocket is an HTTP GET carrying
-    // `Upgrade: websocket` + `Attest-Base-ID`. It shares paths with the proxy
-    // catch-all (`/`, `/{*path}`, method `any`), which would otherwise swallow
-    // it and try to decrypt a non-existent trusted-request body. This guard
-    // sits OUTSIDE TrRequestLayer and, for WS upgrades only, dispatches to the
-    // hand-rolled `ws_upgrade_handler` (which does its own session lookup +
-    // route selection); every other request passes through untouched.
+    // An attested WebSocket is a GET upgrade that shares paths with the proxy
+    // catch-all. This guard, outside TrRequestLayer, routes those upgrades to
+    // the WS handler and passes everything else through.
     merged.layer(axum::middleware::from_fn_with_state(
         state,
         ws_dispatch_middleware,
@@ -389,13 +363,11 @@ async fn healthz() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
 
-/// Readiness: the router is built and serving. Distinct from liveness so an
-/// orchestrator can gate traffic on it.
+/// Readiness: the router is built and serving.
 async fn readyz() -> impl IntoResponse {
     (StatusCode::OK, "ready")
 }
 
-/// Prometheus exposition. Active sessions are sampled from the registry here.
 async fn metrics_handler(State(state): State<ProxyState>) -> impl IntoResponse {
     let active = state.registry.len();
     let body = state.metrics.render_prometheus(active);
@@ -409,15 +381,9 @@ async fn metrics_handler(State(state): State<ProxyState>) -> impl IntoResponse {
     )
 }
 
-/// Seal a proxy-GENERATED error (no-route, upstream failure, too-large, ...)
-/// into the SAME framed `seal_stream` envelope as a normal upstream response
-/// (BLOCKER A). Because the request already passed TrRequestLayer + decrypt,
-/// the client always decodes a `StreamFrame::Head` and can recover the true
-/// error status — it never sees a bare non-2xx HTTP status that it would
-/// otherwise misclassify as a transport failure (and possibly retry).
-///
-/// The stream is two frames: a `Head` carrying the status, then a single `Body`
-/// frame with the message text, mirroring a normal (status, body) response.
+/// Seal a proxy-generated error into the same framed response as a normal reply,
+/// so the client recovers the real status instead of a bare non-2xx it would
+/// misread as a transport failure. Emits a `Head` frame then one `Body` frame.
 fn seal_error(session: OpenHttpaSession, status: StatusCode, message: &str) -> Response {
     let frames: Vec<Result<StreamFrame, LlmError>> = vec![
         Ok(StreamFrame::Head {
@@ -434,20 +400,15 @@ fn seal_error(session: OpenHttpaSession, status: StatusCode, message: &str) -> R
 async fn proxy_handler(State(state): State<ProxyState>, req: DecryptedRequest) -> Response {
     let max = state.max_body_bytes;
 
-    // Enforce max_body_bytes on the inbound (decrypted) request body. SEALED
-    // per BLOCKER A so the client recovers a real 413, not a transport error.
     if req.body.len() > max {
         return seal_error(req.session, StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
     }
 
-    // Select the upstream from the live route table by (host, path).
     let table = state.routes.load();
     let Some(route) = table.select(&req.host, &req.path) else {
         tracing::warn!(host = %req.host, path = %req.path, "no route matched");
         return seal_error(req.session, StatusCode::NOT_FOUND, "no route matched");
     };
-    // HOOK (task #7): enforce route.strict_attestation here once real
-    // verifiers/no-mock-release guards exist.
 
     let mut url = route.upstream.trim_end_matches('/').to_owned();
     url.push_str(&req.path);
@@ -477,8 +438,6 @@ async fn proxy_handler(State(state): State<ProxyState>, req: DecryptedRequest) -
         Ok(r) => r,
         Err(e) => {
             state.metrics.inc_upstream_errors();
-            // Distinguish timeout (504) from other connect/transport failures
-            // (502). Both are SEALED per BLOCKER A.
             let status = if e.is_timeout() {
                 StatusCode::GATEWAY_TIMEOUT
             } else {
@@ -491,10 +450,8 @@ async fn proxy_handler(State(state): State<ProxyState>, req: DecryptedRequest) -
 
     let status = upstream_resp.status().as_u16();
 
-    // SHOULD-FIX 3: build the set of header names to strip = static hop-by-hop
-    // list PLUS the tokens nominated by the upstream `Connection` header
-    // (lowercased). The server strips these itself BEFORE sealing so secrets
-    // named by `Connection: X-Hop` cannot leak into the sealed envelope.
+    // Strip the static hop-by-hop headers plus any names the upstream lists in
+    // its Connection header, so a Connection-nominated secret cannot leak.
     let mut strip: std::collections::HashSet<String> = upstream_resp
         .headers()
         .get(http::header::CONNECTION)
@@ -518,8 +475,7 @@ async fn proxy_handler(State(state): State<ProxyState>, req: DecryptedRequest) -
         })
         .collect();
 
-    // SHOULD-FIX 2: reject early when Content-Length is present and already
-    // over the cap, so we never start buffering an oversized body.
+    // Reject up front on an over-cap Content-Length, before buffering anything.
     if let Some(len) = upstream_resp.content_length()
         && len > max as u64
     {
@@ -527,25 +483,15 @@ async fn proxy_handler(State(state): State<ProxyState>, req: DecryptedRequest) -
         return seal_error(req.session, StatusCode::PAYLOAD_TOO_LARGE, "upstream body too large");
     }
 
-    // STREAMING RESEAL (task #13): instead of buffering the whole upstream body
-    // and sealing one monolithic blob, emit a `seal_stream` frame sequence:
-    //   1) `StreamFrame::Head` carrying the real status + filtered headers
-    //      (fidelity guarantee — the transport drops the real HTTP status), then
-    //   2) one `StreamFrame::Body` per upstream chunk, sealed AND sent as it
-    //      arrives so the server never holds the full body in memory.
-    //
-    // The incremental cap (SHOULD-FIX 2) is preserved INSIDE the stream: a
-    // running byte counter aborts mid-stream once the accumulated body exceeds
-    // `max`. Because frames may already be in flight to the client at that
-    // point we cannot "replace" them with a sealed 413 (the Head/200 is gone),
-    // so we terminate the stream with a transport error; the client enforces
-    // the same cap independently (see bridge.rs) and surfaces a 413/502.
+    // Stream the response as a Head frame (status + headers) followed by one
+    // Body frame per upstream chunk, sealed as they arrive so the body is never
+    // held whole. The size cap is enforced against a running total; once frames
+    // are in flight the Head is already sent, so an over-cap body ends the
+    // stream with a transport error and the client enforces the same cap.
     use futures_util::StreamExt;
     let head = StreamFrame::Head { status, headers };
     let upstream_stream = upstream_resp.bytes_stream();
 
-    // State threaded through the frame stream: accumulated body length + the
-    // configured cap. `scan` lets each chunk update the running total.
     let body_frames = upstream_stream.scan(0usize, move |acc, chunk| {
         let out = match chunk {
             Ok(c) => {
@@ -568,16 +514,11 @@ async fn proxy_handler(State(state): State<ProxyState>, req: DecryptedRequest) -
     let frame_stream =
         futures_util::stream::once(async move { Ok::<_, LlmError>(head) }).chain(body_frames);
 
-    // seal_stream consumes the session and frames each `StreamFrame` with the
-    // server-write key + monotonic counter (no replay guard on this
-    // direction), producing the `[len][counter][ciphertext]` wire framing.
     req.session.seal_stream(frame_stream)
 }
 
-// Static hop-by-hop / framing headers stripped before sealing: the body is
-// re-encoded and re-framed by the sealing layer, so the upstream's
-// content-length/encoding no longer apply. The dynamic `Connection`-nominated
-// tokens are added at runtime (SHOULD-FIX 3).
+// Stripped before sealing; the body is re-framed, so the upstream's framing
+// headers no longer apply. Connection-nominated names are added at runtime.
 const STATIC_HOP_BY_HOP: &[&str] = &[
     "content-length",
     "transfer-encoding",

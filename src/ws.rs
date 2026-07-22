@@ -1,50 +1,25 @@
-// Attested WebSocket passthrough (task #14).
+// Attested WebSocket passthrough. The client opens an attested WS to this
+// server, which proxies it to an upstream `ws://` backend chosen from the route
+// table, pumping frames both ways for the connection's lifetime.
 //
-// A local app opens `ws://127.0.0.1:<port>/...` against the CLIENT bridge; the
-// client establishes an attested WS to THIS server (hand-rolled, see the client
-// session.rs), and we proxy that to an upstream `ws://` backend selected from
-// the live route table, pumping frames BOTH directions for the connection
-// lifetime.
+// The SDK's `attested_ws_upgrade` handler never sees the request path and so
+// cannot select an upstream. This handler reuses the SDK's key-derivation
+// primitives (`peek_keys` + `cipher_suite_to_aead`) but drives the upgrade
+// itself to
+// route per connection. The wire frame format matches the SDK
+// (12-byte nonce || AEAD(type||payload), AAD = "openhttpa:" + atb-id), so the
+// client interoperates with either handler.
 //
-// ROUTING (why we don't use the SDK's `attested_ws_upgrade` directly)
-// ===================================================================
-// The SDK ships `openhttpa_server::ws::attested_ws_upgrade::<H>` -- a fixed
-// axum GET handler that derives the per-WS AEAD keys and calls a static
-// `AttestWsHandler`. But that handler NEVER sees the request path/host, so it
-// cannot select an upstream from our route table. We therefore REUSE the SDK's
-// public primitives (`AttestWsSession::new` key derivation logic, replicated
-// here via `peek_keys` + `cipher_suite_to_aead`) but drive the upgrade
-// ourselves so route selection happens per-connection. The on-the-wire frame
-// format is byte-identical to `ws.rs` (12-byte nonce || AEAD(type||payload),
-// AAD = "openhttpa:" + atb-id) so the hand-rolled client interops with EITHER
-// this handler or the stock SDK one.
+// A WS upgrade is a GET carrying `Upgrade: websocket` and `Attest-Base-ID`,
+// which the proxy catch-all would otherwise consume; `build_router` installs a
+// guard outside `TrRequestLayer` that diverts upgrades here. Session lookup and
+// key derivation happen here rather than via the layer.
 //
-// DISPATCH (how a WS upgrade avoids the proxy catch-all)
-// ======================================================
-// An attested WS is an HTTP GET carrying `Upgrade: websocket` + the
-// `Attest-Base-ID` header. The normal proxy routes (`/` and `/{*path}`,
-// method `any`) would otherwise swallow it and try to decrypt a non-existent
-// trusted-request body. `build_router` (in proxy.rs) installs a
-// `from_fn_with_state` guard OUTSIDE the `TrRequestLayer`: it inspects every
-// request and, when it is a WS upgrade, dispatches to `ws_upgrade_handler`
-// here; otherwise it passes through untouched to the existing proxy/observ-
-// ability routes. We do session lookup + key derivation ourselves (the
-// `TrRequestLayer` injects the session only for the proxy path, and its
-// model is single-request, not a long-lived socket).
-//
-// SESSION LIFECYCLE (long-lived WS vs single-use HTTP pool)
-// =========================================================
-// A trusted HTTP request is single-use per session (random per-request nonce +
-// SlidingWindow guard -- see the client session.rs headline docs). A WS is
-// DIFFERENT: it uses ORDERED COUNTER nonces (TLS-1.3 XOR construction, counter
-// 1,2,3,...) in EACH direction, exactly like the SDK's `AttestWsSession`. A
-// single attested session therefore carries an entire WS conversation: the
-// inbound (client->server) direction enforces a STRICT-MONOTONIC counter
-// (replay/reorder protection, mirroring `AttestWsSession::decode_frame`), and
-// the outbound (server->client) direction seals with a monotonic
-// `BoundAeadKey` counter. This coexists with the HTTP pool because a WS upgrade
-// consumes a DEDICATED session for its whole lifetime -- it is never returned
-// to / drawn from the single-use request pool.
+// Unlike a single-use HTTP request, a WS uses ordered-counter nonces in each
+// direction, so one dedicated session carries the whole conversation: inbound
+// frames require a strictly monotonic counter, outbound frames seal with a
+// monotonic counter. The session is never drawn from or returned to the HTTP
+// request pool.
 
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
 use axum::http::StatusCode;
@@ -73,7 +48,7 @@ const MIN_FRAME: usize = 12 + 1 + 16;
 const MAX_WS_FRAME: usize = 16 * 1024 * 1024;
 
 /// Detect an attested WebSocket upgrade: an HTTP GET carrying the WebSocket
-/// `Upgrade` token AND the `Attest-Base-ID` header. Used by the dispatch guard
+/// `Upgrade` token and the `Attest-Base-ID` header. Used by the dispatch guard
 /// in `build_router` to route the request here instead of the proxy catch-all.
 #[must_use]
 pub fn is_attested_ws_upgrade(req: &axum::extract::Request) -> bool {
@@ -108,15 +83,15 @@ impl WsKeys {
         let algorithm = cipher_suite_to_aead(session.state().cipher_suite);
         session
             .peek_keys(|keys| {
-                let mut swiv = [0u8; 12];
-                let mut cwiv = [0u8; 12];
-                swiv.copy_from_slice(&keys.server_write_iv[..12]);
-                cwiv.copy_from_slice(&keys.client_write_iv[..12]);
+                let mut server_iv = [0u8; 12];
+                let mut client_iv = [0u8; 12];
+                server_iv.copy_from_slice(&keys.server_write_iv[..12]);
+                client_iv.copy_from_slice(&keys.client_write_iv[..12]);
                 Self {
                     server_write_key: keys.server_write_key.clone(),
-                    server_write_iv: swiv,
+                    server_write_iv: server_iv,
                     client_write_key: keys.client_write_key.clone(),
-                    client_write_iv: cwiv,
+                    client_write_iv: client_iv,
                     algorithm,
                 }
             })
@@ -162,7 +137,7 @@ pub async fn ws_upgrade_handler(
     use openhttpa_proto::AtbId;
 
     // 1. Session lookup from the Attest-Base-ID header (the WS path is not
-    //    behind TrRequestLayer, so we authenticate the upgrade ourselves).
+    //    behind TrRequestLayer, so the upgrade is authenticated here).
     let atb_id: Option<AtbId> = req_parts
         .base_id
         .as_deref()
@@ -196,8 +171,8 @@ pub async fn ws_upgrade_handler(
         }
     };
 
-    // 3. Derive per-WS keys from the session BEFORE the upgrade (so a failure
-    //    surfaces as a clean HTTP error, not a half-open socket).
+    // 3. Derive per-WS keys before the upgrade so a failure surfaces as a
+    //    clean HTTP error rather than a half-open socket.
     let Some(keys) = WsKeys::from_session(&session) else {
         return (StatusCode::UNAUTHORIZED, "session keys unavailable").into_response();
     };
@@ -205,7 +180,6 @@ pub async fn ws_upgrade_handler(
 
     debug!(%atb_id, upstream = %upstream_url, "upgrading to attested WebSocket passthrough");
 
-    // 4. Perform the HTTP -> WS upgrade and run the bridge.
     ws.on_upgrade(move |socket| async move {
         if let Err(e) = run_bridge(socket, &upstream_url, keys, aad).await {
             debug!(error = %e, "attested WS bridge ended");
@@ -272,7 +246,7 @@ async fn run_bridge(
     let aad_in = aad.clone();
 
     // client -> upstream: decrypt each client frame, forward to the upstream.
-    let c2u = async move {
+    let client_to_upstream = async move {
         let mut last_counter: u64 = 0;
         while let Some(msg) = client_rx.next().await {
             let msg = match msg {
@@ -308,7 +282,7 @@ async fn run_bridge(
                     return Ok(());
                 }
                 // Plaintext text frames are not part of the attested wire
-                // format; ignore for robustness (mirrors SDK leniency).
+                // format; ignore them, matching SDK behavior.
                 AxumMessage::Text(_) => {}
             }
         }
@@ -316,7 +290,7 @@ async fn run_bridge(
     };
 
     // upstream -> client: encrypt each upstream message, forward to the client.
-    let u2c = async move {
+    let upstream_to_client = async move {
         while let Some(msg) = up_rx.next().await {
             let msg = match msg {
                 Ok(m) => m,
@@ -365,8 +339,8 @@ async fn run_bridge(
     // Whichever direction ends first tears the bridge down; the other future is
     // dropped (closing its sink) for a clean bidirectional teardown.
     tokio::select! {
-        r = c2u => r,
-        r = u2c => r,
+        r = client_to_upstream => r,
+        r = upstream_to_client => r,
     }
 }
 

@@ -1,5 +1,5 @@
-// Pure parsing of `archetype.*` container labels into Routes. No I/O here so
-// the mapping is unit-testable without a live Docker daemon.
+// Parsing of `archetype.*` container labels into Routes. No I/O here, so the
+// mapping can be tested without a live Docker daemon.
 //
 // Label schema (per container):
 //   archetype.enable = true                      (required to opt in)
@@ -11,14 +11,13 @@
 //
 // A container may declare multiple routes via distinct <name> segments. If a
 // container is enabled but declares no `archetype.route.*` keys, a single
-// implicit route named after the container is created IF a top-level
+// implicit route named after the container is created when a top-level
 // `archetype.upstream` is present.
 
 use std::collections::BTreeMap;
 
 use crate::config::{Route, Source, parse_bool_token};
 
-const NS: &str = "archetype.";
 const ENABLE_KEY: &str = "archetype.enable";
 const GLOBAL_STRICT_KEY: &str = "archetype.attestation.strict";
 const IMPLICIT_UPSTREAM_KEY: &str = "archetype.upstream";
@@ -54,7 +53,7 @@ pub fn routes_from_labels(
         let Some(rest) = k.strip_prefix(ROUTE_PREFIX) else {
             continue;
         };
-        // rest = "<name>.<field>"; split on the LAST dot so names may not
+        // rest = "<name>.<field>"; split on the last dot, so names may not
         // contain dots but fields are simple identifiers.
         let Some((name, field)) = rest.rsplit_once('.') else {
             warnings.push(format!("ignoring malformed route label `{k}`"));
@@ -112,7 +111,6 @@ pub fn routes_from_labels(
         }
     }
 
-    let _ = NS; // namespace constant kept for documentation/grep.
     (routes, warnings)
 }
 
