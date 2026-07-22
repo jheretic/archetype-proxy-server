@@ -2701,6 +2701,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "openhttpa-attestation"
 version = "0.1.1"
+source = "git+https://github.com/archetype-linux/openhttpa-rs?branch=tpm-attestation#7f9e3593a0de49ac3a67ae22215b7c8fb5af8b8e"
 dependencies = [
  "aws-lc-rs",
  "base64ct",
@@ -2732,6 +2733,7 @@ dependencies = [
 [[package]]
 name = "openhttpa-client"
 version = "0.1.1"
+source = "git+https://github.com/archetype-linux/openhttpa-rs?branch=tpm-attestation#7f9e3593a0de49ac3a67ae22215b7c8fb5af8b8e"
 dependencies = [
  "bytes",
  "chrono",
@@ -2760,10 +2762,12 @@ dependencies = [
 [[package]]
 name = "openhttpa-config"
 version = "0.1.1"
+source = "git+https://github.com/archetype-linux/openhttpa-rs?branch=tpm-attestation#7f9e3593a0de49ac3a67ae22215b7c8fb5af8b8e"
 
 [[package]]
 name = "openhttpa-core"
 version = "0.1.1"
+source = "git+https://github.com/archetype-linux/openhttpa-rs?branch=tpm-attestation#7f9e3593a0de49ac3a67ae22215b7c8fb5af8b8e"
 dependencies = [
  "bytes",
  "futures",
@@ -2788,6 +2792,7 @@ dependencies = [
 [[package]]
 name = "openhttpa-crypto"
 version = "0.1.1"
+source = "git+https://github.com/archetype-linux/openhttpa-rs?branch=tpm-attestation#7f9e3593a0de49ac3a67ae22215b7c8fb5af8b8e"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -2809,6 +2814,7 @@ dependencies = [
 [[package]]
 name = "openhttpa-headers"
 version = "0.1.1"
+source = "git+https://github.com/archetype-linux/openhttpa-rs?branch=tpm-attestation#7f9e3593a0de49ac3a67ae22215b7c8fb5af8b8e"
 dependencies = [
  "base64ct",
  "bytes",
@@ -2825,6 +2831,7 @@ dependencies = [
 [[package]]
 name = "openhttpa-proto"
 version = "0.1.1"
+source = "git+https://github.com/archetype-linux/openhttpa-rs?branch=tpm-attestation#7f9e3593a0de49ac3a67ae22215b7c8fb5af8b8e"
 dependencies = [
  "base64ct",
  "bytes",
@@ -2838,6 +2845,7 @@ dependencies = [
 [[package]]
 name = "openhttpa-server"
 version = "0.1.1"
+source = "git+https://github.com/archetype-linux/openhttpa-rs?branch=tpm-attestation#7f9e3593a0de49ac3a67ae22215b7c8fb5af8b8e"
 dependencies = [
  "axum",
  "bloomfilter",
@@ -2872,6 +2880,7 @@ dependencies = [
 [[package]]
 name = "openhttpa-tee"
 version = "0.1.1"
+source = "git+https://github.com/archetype-linux/openhttpa-rs?branch=tpm-attestation#7f9e3593a0de49ac3a67ae22215b7c8fb5af8b8e"
 dependencies = [
  "aws-nitro-enclaves-nsm-api",
  "bincode",
@@ -2898,6 +2907,7 @@ dependencies = [
 [[package]]
 name = "openhttpa-transport"
 version = "0.1.1"
+source = "git+https://github.com/archetype-linux/openhttpa-rs?branch=tpm-attestation#7f9e3593a0de49ac3a67ae22215b7c8fb5af8b8e"
 dependencies = [
  "aes-gcm",
  "bytes",

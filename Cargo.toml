@@ -5,15 +5,15 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
-openhttpa-proto       = { path = "../openhttpa-rs/crates/openhttpa-proto" }
-openhttpa-crypto      = { path = "../openhttpa-rs/crates/openhttpa-crypto" }
-openhttpa-headers     = { path = "../openhttpa-rs/crates/openhttpa-headers" }
-openhttpa-core        = { path = "../openhttpa-rs/crates/openhttpa-core" }
-openhttpa-tee         = { path = "../openhttpa-rs/crates/openhttpa-tee" }
-openhttpa-attestation = { path = "../openhttpa-rs/crates/openhttpa-attestation" }
-openhttpa-transport   = { path = "../openhttpa-rs/crates/openhttpa-transport" }
-openhttpa-server      = { path = "../openhttpa-rs/crates/openhttpa-server" }
-openhttpa-client      = { path = "../openhttpa-rs/crates/openhttpa-client" }
+openhttpa-proto       = { git = "https://github.com/archetype-linux/openhttpa-rs", branch = "tpm-attestation" }
+openhttpa-crypto      = { git = "https://github.com/archetype-linux/openhttpa-rs", branch = "tpm-attestation" }
+openhttpa-headers     = { git = "https://github.com/archetype-linux/openhttpa-rs", branch = "tpm-attestation" }
+openhttpa-core        = { git = "https://github.com/archetype-linux/openhttpa-rs", branch = "tpm-attestation" }
+openhttpa-tee         = { git = "https://github.com/archetype-linux/openhttpa-rs", branch = "tpm-attestation" }
+openhttpa-attestation = { git = "https://github.com/archetype-linux/openhttpa-rs", branch = "tpm-attestation" }
+openhttpa-transport   = { git = "https://github.com/archetype-linux/openhttpa-rs", branch = "tpm-attestation" }
+openhttpa-server      = { git = "https://github.com/archetype-linux/openhttpa-rs", branch = "tpm-attestation" }
+openhttpa-client      = { git = "https://github.com/archetype-linux/openhttpa-rs", branch = "tpm-attestation" }
 
 tokio              = { version = "1", features = ["full"] }
 axum               = { version = "0.8", features = ["ws", "query"] }
